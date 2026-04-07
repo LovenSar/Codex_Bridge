@@ -19,7 +19,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 _BRIDGE_RUN_SHA256: str | None = None
@@ -27,26 +26,11 @@ _BRIDGE_LOG_PATH: Path | None = None
 _BRIDGE_INTERACTION_JSONL_PATH: Path | None = None
 _LOG_FILE_LOCK = threading.Lock()
 _LOG_MAX_PAYLOAD_STR = int(os.getenv("CODEX_BRIDGE_LOG_MAX_STR", "500000"))
-# 对话/思考完整落盘与 JSONL 单行上限（默认 1GB 量级，避免误截断）
-_LOG_DIALOGUE_JSONL_MAX_STR = int(os.getenv("CODEX_BRIDGE_LOG_DIALOGUE_JSONL_MAX_STR", str(10**9)))
-_FULL_TRANSCRIPT_ENABLED = (
-    str(os.getenv("CODEX_BRIDGE_LOG_FULL_TRANSCRIPT", "true")).strip().lower() in ("1", "true", "yes", "on")
-)
-_CONSOLE_TRANSCRIPT_CHARS = int(os.getenv("CODEX_BRIDGE_LOG_CONSOLE_TRANSCRIPT_CHARS", "0"))
-# 在运行本进程的终端直接打印「用户说了什么 / 思考 / 助手回了什么」（默认开启）
-_CONSOLE_DIALOGUE_ENABLED = (
-    str(os.getenv("CODEX_BRIDGE_LOG_CONSOLE_DIALOGUE", "true")).strip().lower()
-    in ("1", "true", "yes", "on")
-)
-_CONSOLE_DIALOGUE_MAX_CHARS = int(os.getenv("CODEX_BRIDGE_LOG_CONSOLE_DIALOGUE_MAX_CHARS", "50000"))
-_CONSOLE_DIALOGUE_BANNER_SHOWN = False
-
-_BRIDGE_TRANSCRIPT_PATH: Path | None = None
 
 
 def _ensure_bridge_session_logging() -> None:
     """Once per process: SHA256 run id + log file paths under CODEX_BRIDGE_LOG_DIR (default: ../logs)."""
-    global _BRIDGE_RUN_SHA256, _BRIDGE_LOG_PATH, _BRIDGE_INTERACTION_JSONL_PATH, _BRIDGE_TRANSCRIPT_PATH
+    global _BRIDGE_RUN_SHA256, _BRIDGE_LOG_PATH, _BRIDGE_INTERACTION_JSONL_PATH
     with _LOG_FILE_LOCK:
         if _BRIDGE_RUN_SHA256 is not None:
             return
@@ -64,12 +48,10 @@ def _ensure_bridge_session_logging() -> None:
             log_dir.mkdir(parents=True, exist_ok=True)
         _BRIDGE_LOG_PATH = log_dir / f"bridge-{_BRIDGE_RUN_SHA256}.log"
         _BRIDGE_INTERACTION_JSONL_PATH = log_dir / f"bridge-{_BRIDGE_RUN_SHA256}.interaction.jsonl"
-        _BRIDGE_TRANSCRIPT_PATH = log_dir / f"bridge-{_BRIDGE_RUN_SHA256}.transcript.log"
         ts = datetime.datetime.now().isoformat(timespec="milliseconds")
         banner = (
             f"{ts}\tbridge_session_start\trun_sha256={_BRIDGE_RUN_SHA256}\t"
-            f"log={_BRIDGE_LOG_PATH.name}\tinteraction={_BRIDGE_INTERACTION_JSONL_PATH.name}\t"
-            f"transcript={_BRIDGE_TRANSCRIPT_PATH.name}\n"
+            f"log={_BRIDGE_LOG_PATH.name}\tinteraction={_BRIDGE_INTERACTION_JSONL_PATH.name}\n"
         )
         try:
             with open(_BRIDGE_LOG_PATH, "a", encoding="utf-8") as f:
@@ -94,18 +76,17 @@ def _truncate_for_log(obj: Any, max_str: int | None = None) -> Any:
     return obj
 
 
-def _log_interaction_json(req_id: str, event: str, data: Any, *, max_str: int | None = None) -> None:
+def _log_interaction_json(req_id: str, event: str, data: Any) -> None:
     """Append one JSON line per event for full replay / audit (interaction.jsonl)."""
     _ensure_bridge_session_logging()
     if not _BRIDGE_INTERACTION_JSONL_PATH or not _BRIDGE_RUN_SHA256:
         return
-    lim = max_str if max_str is not None else _LOG_MAX_PAYLOAD_STR
     record = {
         "ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
         "run_sha256": _BRIDGE_RUN_SHA256,
         "req_id": req_id,
         "event": event,
-        "data": _truncate_for_log(data, lim),
+        "data": _truncate_for_log(data),
     }
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
     try:
@@ -136,290 +117,6 @@ def _log(message: str) -> None:
             pass
 
 
-def _json_pretty(obj: Any) -> str:
-    try:
-        return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        return str(obj)
-
-
-def _extract_inbound_text_for_transcript(input_value: Any) -> str:
-    if isinstance(input_value, str):
-        return input_value
-    return _json_pretty(input_value)
-
-
-def _format_upstream_assistant_message(msg: dict[str, Any]) -> str:
-    if not isinstance(msg, dict):
-        return str(msg)
-    parts: list[str] = []
-    for key in ("reasoning_content", "reasoning", "content"):
-        if key in msg and msg.get(key) is not None:
-            val = msg.get(key)
-            s = val if isinstance(val, str) else _json_pretty(val)
-            parts.append(f"--- {key} ---\n{s}")
-    if not parts:
-        return _json_pretty(msg)
-    return "\n\n".join(parts)
-
-
-def _extract_user_text_for_console(inbound_input: Any) -> str:
-    """从 Responses input 或 messages 列表中抽出用户可见文本。"""
-    if inbound_input is None:
-        return ""
-    if isinstance(inbound_input, str):
-        return inbound_input.strip()
-    if not isinstance(inbound_input, list):
-        return _json_pretty(inbound_input)
-    parts: list[str] = []
-    for item in inbound_input:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        if role != "user":
-            continue
-        c = item.get("content")
-        if isinstance(c, str):
-            parts.append(c.strip())
-        elif isinstance(c, list):
-            for p in c:
-                if not isinstance(p, dict):
-                    continue
-                pt = str(p.get("type") or "").strip().lower()
-                if pt in ("input_text", "text"):
-                    parts.append(str(p.get("text") or p.get("input_text") or "").strip())
-        else:
-            parts.append(str(c or "").strip())
-    return "\n---\n".join(parts) if parts else _json_pretty(inbound_input)
-
-
-def _reasoning_plain_text_from_item(item: dict[str, Any]) -> str:
-    """提取 Responses output 中 reasoning 条目的可读文本（兼容官方 reasoning_text 与旧版顶层 text）。"""
-    if not isinstance(item, dict):
-        return ""
-    parts: list[str] = []
-    for p in item.get("content") or []:
-        if not isinstance(p, dict):
-            continue
-        pt = str(p.get("type") or "").strip().lower()
-        if pt == "reasoning_text":
-            parts.append(str(p.get("text") or ""))
-        elif pt in ("text", "output_text"):
-            parts.append(str(p.get("text") or p.get("output_text") or ""))
-    if parts:
-        return "".join(parts)
-    t = item.get("text")
-    if isinstance(t, str) and t.strip():
-        return t
-    return ""
-
-
-def _reasoning_reply_from_responses_dict(d: dict[str, Any]) -> tuple[str, str]:
-    """从上游 Responses JSON 拆出思考与正文。"""
-    reason = ""
-    reply = ""
-    for item in d.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        it = str(item.get("type") or "").strip().lower()
-        if it == "reasoning":
-            reason = _reasoning_plain_text_from_item(item)
-        elif it == "message":
-            for p in item.get("content") or []:
-                if isinstance(p, dict) and str(p.get("type") or "") in ("output_text", "text"):
-                    reply += str(p.get("text") or p.get("output_text") or "")
-    return reason.strip(), reply.strip()
-
-
-def _emit_console_dialogue_summary(
-    req_id: str,
-    phase: str,
-    inbound_input: Any,
-    upstream_chat_completion: dict[str, Any] | None,
-    converted_responses: dict[str, Any] | None,
-    extra: dict[str, Any] | None,
-) -> None:
-    """在运行 bridge 的终端打印用户输入、思考、回复（Codex 所在终端不会显示这里）。"""
-    global _CONSOLE_DIALOGUE_BANNER_SHOWN
-    if not _CONSOLE_DIALOGUE_ENABLED:
-        return
-
-    user_txt = _extract_user_text_for_console(inbound_input)
-    reason = ""
-    reply = ""
-
-    if isinstance(upstream_chat_completion, dict):
-        ch = upstream_chat_completion.get("choices") or []
-        if ch and isinstance(ch[0], dict):
-            msg = ch[0].get("message")
-            if isinstance(msg, dict):
-                reason = str(msg.get("reasoning_content") or msg.get("reasoning") or "")
-                reply = str(msg.get("content") or "")
-
-    if isinstance(converted_responses, dict):
-        if not reason or not reply:
-            r2, p2 = _reasoning_reply_from_responses_dict(converted_responses)
-            if not reason:
-                reason = r2
-            if not reply:
-                reply = p2
-
-    if isinstance(extra, dict):
-        uj = extra.get("upstream_responses_json")
-        if isinstance(uj, dict) and (not reason or not reply):
-            r3, p3 = _reasoning_reply_from_responses_dict(uj)
-            if not reason:
-                reason = r3
-            if not reply:
-                reply = p3
-        atm = extra.get("assistant_text_merged")
-        if isinstance(atm, str) and atm.strip():
-            reply = atm
-        ocr = extra.get("openai_chat_completion_result")
-        if isinstance(ocr, dict):
-            ch = ocr.get("choices") or []
-            if ch and isinstance(ch[0], dict):
-                msg = ch[0].get("message")
-                if isinstance(msg, dict) and not reply:
-                    reply = str(msg.get("content") or "")
-
-    lines = [
-        "",
-        "╔" + "═" * 70 + "╗",
-        f"║ bridge 对话摘要  req={req_id}  {phase}",
-        "╚" + "═" * 70 + "╝",
-        "[用户发送]",
-        user_txt if user_txt.strip() else "(无)",
-        "",
-        "[思考 / reasoning]",
-        reason if reason.strip() else "(无)",
-        "",
-        "[助手回复]",
-        reply if reply.strip() else "(无)",
-        "",
-    ]
-    text = "\n".join(lines)
-    if len(text) > _CONSOLE_DIALOGUE_MAX_CHARS:
-        text = text[: _CONSOLE_DIALOGUE_MAX_CHARS] + "\n...[truncated，完整内容见 .transcript.log]"
-
-    if not _CONSOLE_DIALOGUE_BANNER_SHOWN:
-        _CONSOLE_DIALOGUE_BANNER_SHOWN = True
-        _log(
-            "提示：以下 [用户发送]/[思考]/[助手回复] 出现在「运行 python chat_bridge.py 的终端」；"
-            "Codex 界面是另一个进程，不会在这里显示。"
-        )
-    _log(text)
-
-
-def _responses_output_plain_text(converted: dict[str, Any]) -> str:
-    out = converted.get("output") or []
-    parts: list[str] = []
-    for item in out:
-        if not isinstance(item, dict):
-            continue
-        it = str(item.get("type") or "").strip().lower()
-        if it == "reasoning":
-            parts.append("【思考 / reasoning】\n" + _reasoning_plain_text_from_item(item))
-        elif it == "message":
-            c = item.get("content")
-            if isinstance(c, list):
-                for p in c:
-                    if isinstance(p, dict) and str(p.get("type") or "") in ("output_text", "text"):
-                        parts.append(
-                            "【助手正文】\n"
-                            + str(p.get("text") or p.get("output_text") or "")
-                        )
-        elif it == "function_call":
-            parts.append("【function_call】\n" + _json_pretty(item))
-    return "\n\n".join(parts) if parts else _json_pretty(converted)
-
-
-def _log_dialogue_transcript(
-    req_id: str,
-    phase: str,
-    *,
-    inbound_input: Any = None,
-    chat_payload: dict[str, Any] | None = None,
-    upstream_chat_completion: dict[str, Any] | None = None,
-    converted_responses: dict[str, Any] | None = None,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    """终端摘要 + 将完整内容写入 .transcript.log / JSONL。"""
-    _emit_console_dialogue_summary(
-        req_id,
-        phase,
-        inbound_input,
-        upstream_chat_completion,
-        converted_responses,
-        extra,
-    )
-
-    if not _FULL_TRANSCRIPT_ENABLED:
-        return
-    _ensure_bridge_session_logging()
-    if not _BRIDGE_TRANSCRIPT_PATH:
-        return
-    ts = datetime.datetime.now().isoformat(timespec="milliseconds")
-    block_parts: list[str] = [
-        f"\n{'=' * 72}\n{ts}  req={req_id}  {phase}\n{'=' * 72}",
-    ]
-    if inbound_input is not None:
-        block_parts.append("\n--- inbound input（完整）---\n")
-        block_parts.append(_extract_inbound_text_for_transcript(inbound_input))
-    if chat_payload is not None:
-        block_parts.append("\n--- 发往上游 chat/completions（完整 JSON）---\n")
-        block_parts.append(_json_pretty(chat_payload))
-    if upstream_chat_completion is not None:
-        block_parts.append("\n--- 上游 chat/completions 响应（完整 JSON）---\n")
-        block_parts.append(_json_pretty(upstream_chat_completion))
-        choices = upstream_chat_completion.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            msg0 = choices[0].get("message")
-            if isinstance(msg0, dict):
-                block_parts.append("\n--- 上游 assistant 消息（纯文本拆分）---\n")
-                block_parts.append(_format_upstream_assistant_message(msg0))
-    if converted_responses is not None:
-        block_parts.append("\n--- 转换后的 Responses（完整 JSON）---\n")
-        block_parts.append(_json_pretty(converted_responses))
-        block_parts.append("\n--- 转换后 output 可读摘要（思考+正文）---\n")
-        block_parts.append(_responses_output_plain_text(converted_responses))
-    if extra:
-        block_parts.append("\n--- extra ---\n")
-        block_parts.append(_json_pretty(extra))
-    block_parts.append("\n")
-    block = "".join(block_parts)
-    try:
-        with _LOG_FILE_LOCK:
-            with open(_BRIDGE_TRANSCRIPT_PATH, "a", encoding="utf-8") as f:
-                f.write(block)
-    except Exception:
-        pass
-
-    total_chars = len(block)
-    _log(
-        f"req={req_id} dialogue_transcript phase={phase} transcript_chars={total_chars} "
-        f"file={_BRIDGE_TRANSCRIPT_PATH.name}"
-    )
-    if _CONSOLE_TRANSCRIPT_CHARS > 0:
-        preview = block[:_CONSOLE_TRANSCRIPT_CHARS]
-        _log(f"req={req_id} transcript_preview_begin\n{preview}")
-        if len(block) > _CONSOLE_TRANSCRIPT_CHARS:
-            _log(f"req={req_id} transcript_preview_truncated total_chars={len(block)}")
-
-    _log_interaction_json(
-        req_id,
-        f"dialogue.transcript.{phase}",
-        {
-            "inbound_input": inbound_input,
-            "chat_payload": chat_payload,
-            "upstream_chat_completion": upstream_chat_completion,
-            "converted_responses": converted_responses,
-            "extra": extra,
-        },
-        max_str=_LOG_DIALOGUE_JSONL_MAX_STR,
-    )
-
-
 RESPONSES_COMPAT_CHAT_ENABLED = (
     str(os.getenv("CODEX_BRIDGE_RESPONSES_COMPAT_CHAT", "true")).strip().lower()
     in ("1", "true", "yes", "on")
@@ -442,55 +139,7 @@ RESPONSES_COMPAT_CHAT_STREAM_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 
-# /v1/responses compat：上游为非流式 chat.completions，回包后再发 SSE。若为 true，则合成
-# response.created / output_item.added / reasoning_text.delta / output_text.delta 等事件，供 Codex TUI 渲染。
-CODEX_BRIDGE_TUI_SSE_COMPAT = (
-    str(os.getenv("CODEX_BRIDGE_TUI_SSE_COMPAT", "true")).strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
 MAX_TOOL_CALL_ROUNDS = int(os.getenv("CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS", "40"))
-
-# Model aliasing: map Codex internal model names to your actual model
-# Format: comma-separated pairs like "gpt-5.4-mini=Qwen/Qwen3.5-27B,gpt-4o=Qwen/Qwen3.5-27B"
-_MODEL_ALIAS_MAP: dict[str, str] = {}
-_alias_config = os.getenv("CODEX_BRIDGE_MODEL_ALIASES", "").strip()
-if _alias_config:
-    for pair in _alias_config.split(","):
-        if "=" in pair:
-            src, dst = pair.split("=", 1)
-            _MODEL_ALIAS_MAP[src.strip()] = dst.strip()
-else:
-    # Default: map common GPT models to Qwen
-    _MODEL_ALIAS_MAP = {
-        "gpt-5.4-mini": "Qwen/Qwen3.5-27B",
-        "gpt-5-mini": "Qwen/Qwen3.5-27B",
-        "gpt-4o": "Qwen/Qwen3.5-27B",
-        "gpt-4o-mini": "Qwen/Qwen3.5-27B",
-        "gpt-4": "Qwen/Qwen3.5-27B",
-        "gpt-3.5-turbo": "Qwen/Qwen3.5-27B",
-    }
-
-
-def _resolve_model_name(raw_model: str, default_model: str) -> tuple[str, str, bool]:
-    """
-    Resolve the actual model name with aliasing.
-    Returns: (final_model, model_source, was_aliased)
-    """
-    if not raw_model or not raw_model.strip():
-        return default_model, "default", False
-    
-    model = raw_model.strip()
-    was_aliased = False
-    
-    # Check if model should be aliased
-    if model in _MODEL_ALIAS_MAP:
-        original = model
-        model = _MODEL_ALIAS_MAP[model]
-        was_aliased = True
-        _log(f"model_alias: {original} -> {model}")
-    
-    return model, "payload", was_aliased
 
 
 def _count_tool_call_rounds(input_value: Any) -> int:
@@ -1306,64 +955,6 @@ def _extract_response_completed_from_sse_body(text: str) -> dict[str, Any] | Non
     return None
 
 
-def _sse_event_lines_enabled() -> bool:
-    """Codex / OpenAI 客户端常按 SSE 的 event: 名区分帧；仅发 data: 时可能只走默认 message，界面不渲染。"""
-    return str(os.getenv("CODEX_BRIDGE_SSE_EVENT_LINES", "true")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _append_sse_json_lines(lines: list[str], payload: dict[str, Any]) -> None:
-    """单条 SSE 事件：可选 event: <type>，再 data: {json}，与官方 Responses 流式对齐。"""
-    data = json.dumps(payload, ensure_ascii=False, default=str)
-    if _sse_event_lines_enabled():
-        t = str(payload.get("type") or "").strip()
-        if t:
-            lines.append(f"event: {t}")
-    lines.append(f"data: {data}")
-    lines.append("")
-
-
-def _sse_streaming_headers() -> dict[str, str]:
-    return {
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-
-
-def _truncate_resp_completed_reasoning_for_sse(resp: dict[str, Any]) -> None:
-    """response.completed 里超长 reasoning 可能撑爆 Codex 解析；默认截断（可用环境变量调大）。"""
-    try:
-        lim = int(os.getenv("CODEX_BRIDGE_COMPLETED_MAX_REASONING_CHARS", "65536"))
-    except ValueError:
-        lim = 65536
-    if lim <= 0:
-        return
-    out = resp.get("output")
-    if not isinstance(out, list):
-        return
-    for item in out:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type") or "").strip().lower() != "reasoning":
-            continue
-        txt = item.get("text")
-        if isinstance(txt, str) and len(txt) > lim:
-            item["text"] = txt[: max(0, lim - 24)] + "\n...[truncated]..."
-        for p in item.get("content") or []:
-            if not isinstance(p, dict):
-                continue
-            if str(p.get("type") or "").strip().lower() != "reasoning_text":
-                continue
-            t = p.get("text")
-            if isinstance(t, str) and len(t) > lim:
-                p["text"] = t[: max(0, lim - 24)] + "\n...[truncated]..."
-
-
 def _build_minimal_response_sse(response_obj: dict[str, Any]) -> str:
     response_payload = dict(response_obj) if isinstance(response_obj, dict) else {}
     response_id = str(response_payload.get("id") or "").strip()
@@ -1378,7 +969,7 @@ def _build_minimal_response_sse(response_obj: dict[str, Any]) -> str:
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get("type") or "").strip().lower()
-            if item_type in ("function_call", "message", "reasoning"):
+            if item_type in ("function_call", "message"):
                 events.append(
                     {
                         "type": "response.output_item.done",
@@ -1391,191 +982,15 @@ def _build_minimal_response_sse(response_obj: dict[str, Any]) -> str:
 
     lines: list[str] = []
     for payload in events:
-        _append_sse_json_lines(lines, payload)
-    lines.append("data: [DONE]")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _tui_sse_chunk_chars() -> int:
-    try:
-        v = int(os.getenv("CODEX_BRIDGE_TUI_SSE_CHUNK_CHARS", "48"))
-    except ValueError:
-        v = 48
-    return max(1, min(v, 4096))
-
-
-def _split_sse_text_chunks(text: str, chunk_size: int) -> list[str]:
-    if not text:
-        return []
-    out: list[str] = []
-    i = 0
-    s = str(text)
-    while i < len(s):
-        out.append(s[i : i + chunk_size])
-        i += chunk_size
-    return out
-
-
-def _message_item_output_text(item: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for p in item.get("content") or []:
-        if not isinstance(p, dict):
-            continue
-        if str(p.get("type") or "").strip().lower() in ("output_text", "text"):
-            parts.append(str(p.get("text") or p.get("output_text") or ""))
-    return "".join(parts)
-
-
-def _build_codex_tui_compat_stream_sse(response_obj: dict[str, Any]) -> str:
-    """
-    在「非流式上游 + 最终 Responses 对象」场景下，合成与 OpenAI Responses 流式相近的事件序列，
-    供 Codex TUI 依赖 delta 事件时仍能显示思考与正文。
-    """
-    response_payload = dict(response_obj) if isinstance(response_obj, dict) else {}
-    response_id = str(response_payload.get("id") or "").strip()
-    if not response_id:
-        response_id = f"resp_{uuid.uuid4().hex[:12]}"
-        response_payload["id"] = response_id
-    model = str(response_payload.get("model") or "")
-    created_at = int(response_payload.get("created_at") or time.time())
-    chunk_sz = _tui_sse_chunk_chars()
-
-    events: list[dict[str, Any]] = []
-    seq = 0
-
-    def emit(ev: dict[str, Any]) -> None:
-        nonlocal seq
-        payload = dict(ev)
-        payload["sequence_number"] = seq
-        seq += 1
-        events.append(payload)
-
-    emit(
-        {
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": created_at,
-                "model": model,
-                "status": "in_progress",
-            },
-        }
-    )
-
-    output = response_payload.get("output")
-    if not isinstance(output, list):
-        output = []
-
-    for output_index, item in enumerate(output):
-        if not isinstance(item, dict):
-            continue
-        item_type = str(item.get("type") or "").strip().lower()
-
-        emit(
-            {
-                "type": "response.output_item.added",
-                "response_id": response_id,
-                "output_index": output_index,
-                "item": item,
-            }
-        )
-
-        if item_type == "reasoning":
-            rid = str(item.get("id") or f"rs_{uuid.uuid4().hex[:10]}")
-            rtext = _reasoning_plain_text_from_item(item)
-            for piece in _split_sse_text_chunks(rtext, chunk_sz):
-                emit(
-                    {
-                        "type": "response.reasoning_text.delta",
-                        "response_id": response_id,
-                        "delta": piece,
-                        "item_id": rid,
-                        "output_index": output_index,
-                        "content_index": 0,
-                    }
-                )
-            emit(
-                {
-                    "type": "response.reasoning_text.done",
-                    "response_id": response_id,
-                    "item_id": rid,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "text": rtext,
-                }
-            )
-        elif item_type == "message":
-            mid = str(item.get("id") or f"msg_{uuid.uuid4().hex[:10]}")
-            mtext = _message_item_output_text(item)
-            for piece in _split_sse_text_chunks(mtext, chunk_sz):
-                emit(
-                    {
-                        "type": "response.output_text.delta",
-                        "response_id": response_id,
-                        "delta": piece,
-                        "item_id": mid,
-                        "output_index": output_index,
-                        "content_index": 0,
-                    }
-                )
-            emit(
-                {
-                    "type": "response.output_text.done",
-                    "response_id": response_id,
-                    "item_id": mid,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "text": mtext,
-                }
-            )
-        elif item_type == "function_call":
-            pass
-
-        emit(
-            {
-                "type": "response.output_item.done",
-                "response_id": response_id,
-                "output_index": output_index,
-                "item": item,
-            }
-        )
-
-    emit({"type": "response.completed", "response": response_payload})
-
-    lines: list[str] = []
-    for payload in events:
-        _append_sse_json_lines(lines, payload)
+        lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+        lines.append("")
     lines.append("data: [DONE]")
     lines.append("")
     return "\n".join(lines)
 
 
 def _sse_data_line_bytes(payload: dict[str, Any]) -> bytes:
-    lines: list[str] = []
-    _append_sse_json_lines(lines, payload)
-    return "\n".join(lines).encode("utf-8")
-
-
-def _sse_pregenerated_text_as_streaming_response(sse_body: str) -> Any:
-    """
-    将已拼好的 SSE 字符串按事件分块下发，避免整段 body 一次写出导致客户端/插件缓冲、界面不刷新。
-    """
-    from starlette.responses import StreamingResponse
-
-    async def gen() -> Any:
-        s = (sse_body or "").replace("\r\n", "\n")
-        parts = [p.strip() for p in s.split("\n\n") if p.strip()]
-        for p in parts:
-            yield (p + "\n\n").encode("utf-8")
-
-    return StreamingResponse(
-        gen(),
-        status_code=200,
-        media_type="text/event-stream; charset=utf-8",
-        headers=_sse_streaming_headers(),
-    )
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 async def _httpx_streaming_body_close(resp: Any) -> None:
@@ -1598,48 +1013,7 @@ async def _starlette_stream_from_httpx(resp: Any) -> Any:
         finally:
             await _httpx_streaming_body_close(resp)
 
-    return StreamingResponse(
-        gen(),
-        status_code=resp.status_code,
-        media_type=media_type,
-        headers=_sse_streaming_headers(),
-    )
-
-
-def _merge_choice_message_snapshot_into_state(state: dict[str, Any], ch0: dict[str, Any]) -> None:
-    """部分上游在最后一个 chunk 只填 choices[0].message、delta 为空或 null，若不合并会丢全文。"""
-    msg = ch0.get("message")
-    if not isinstance(msg, dict):
-        return
-    if msg.get("content") is not None:
-        piece = _extract_text_from_content(msg.get("content"))
-        if piece.strip():
-            cur = str(state.get("content") or "").strip()
-            if not cur:
-                state["content"] = piece
-            elif len(piece) > len(str(state.get("content") or "")):
-                state["content"] = piece
-    for key in ("reasoning_content", "reasoning"):
-        if msg.get(key) is not None:
-            state[key] = str(state.get(key) or "") + str(msg.get(key))
-    tcs = msg.get("tool_calls")
-    if isinstance(tcs, list) and tcs:
-        if "tool_calls" not in state:
-            state["tool_calls"] = {}
-        tc_map: dict[int, dict[str, Any]] = state["tool_calls"]
-        for tc in tcs:
-            if not isinstance(tc, dict):
-                continue
-            idx = int(tc.get("index") or 0)
-            bucket = tc_map.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-            if tc.get("id"):
-                bucket["id"] = str(tc.get("id"))
-            fn = tc.get("function")
-            if isinstance(fn, dict):
-                if fn.get("name"):
-                    bucket["name"] = str(fn.get("name"))
-                if fn.get("arguments") is not None:
-                    bucket["arguments"] = str(bucket.get("arguments") or "") + str(fn.get("arguments"))
+    return StreamingResponse(gen(), status_code=resp.status_code, media_type=media_type)
 
 
 def _accumulate_chat_completion_chunk(state: dict[str, Any], data_obj: dict[str, Any]) -> None:
@@ -1647,19 +1021,13 @@ def _accumulate_chat_completion_chunk(state: dict[str, Any], data_obj: dict[str,
     if not isinstance(choices, list) or not choices:
         return
     ch0 = choices[0] if isinstance(choices[0], dict) else {}
-    delta = ch0.get("delta")
+    delta = ch0.get("delta") if isinstance(ch0, dict) else {}
     if not isinstance(delta, dict):
-        delta = {}
+        return
     if delta.get("role"):
         state["role"] = delta.get("role")
     if delta.get("content") is not None:
         state["content"] = str(state.get("content") or "") + str(delta.get("content"))
-    if delta.get("reasoning_content") is not None:
-        state["reasoning_content"] = str(state.get("reasoning_content") or "") + str(
-            delta.get("reasoning_content")
-        )
-    if delta.get("reasoning") is not None:
-        state["reasoning"] = str(state.get("reasoning") or "") + str(delta.get("reasoning"))
     tcs = delta.get("tool_calls")
     if isinstance(tcs, list):
         if "tool_calls" not in state:
@@ -1678,16 +1046,10 @@ def _accumulate_chat_completion_chunk(state: dict[str, Any], data_obj: dict[str,
                     bucket["name"] = str(fn.get("name"))
                 if fn.get("arguments") is not None:
                     bucket["arguments"] = str(bucket.get("arguments") or "") + str(fn.get("arguments"))
-    _merge_choice_message_snapshot_into_state(state, ch0)
 
 
 def _accumulated_stream_state_to_message(state: dict[str, Any]) -> dict[str, Any]:
     msg: dict[str, Any] = {"role": "assistant", "content": state.get("content") or ""}
-    r1 = state.get("reasoning_content") or ""
-    r2 = state.get("reasoning") or ""
-    combined = (r1 + r2) if (str(r1).strip() or str(r2).strip()) else ""
-    if combined.strip():
-        msg["reasoning_content"] = combined
     tcalls = state.get("tool_calls")
     if isinstance(tcalls, dict) and tcalls:
         out_tc: list[dict[str, Any]] = []
@@ -1713,155 +1075,39 @@ async def _translate_chat_sse_to_response_sse(
 ) -> Any:
     """
     Convert upstream chat.completions SSE into Responses-style SSE (Codex /v1/responses).
-    发出与 OpenAI Responses 流式事件对齐的 reasoning / output_text delta，便于 TUI 渲染思考过程。
     """
     from starlette.responses import StreamingResponse
 
     response_id = f"resp_{uuid.uuid4().hex[:16]}"
-    message_item_id = f"msg_{uuid.uuid4().hex[:10]}"
 
     async def gen():
         state: dict[str, Any] = {}
-        seq = 0
-        stream_read_err: Exception | None = None
-        had_output_text_delta: bool = False
-        # Codex CLI 对海量逐 token SSE 帧易在 response.completed 前超时/断开；默认不内联发 delta，只在收尾发整段。
-        skip_inline_deltas = str(os.getenv("CODEX_BRIDGE_SKIP_COMPAT_STREAM_DELTAS", "1")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
         try:
-            yield _sse_data_line_bytes(
-                {
-                    "type": "response.created",
-                    "sequence_number": seq,
-                    "response": {
-                        "id": response_id,
-                        "object": "response",
-                        "created_at": int(time.time()),
-                        "model": model,
-                        "status": "in_progress",
-                    },
-                }
-            )
-            seq += 1
-            # Codex 在收到 delta 前需要先有 output_item.added，否则会在 response.completed 前断开连接。
-            yield _sse_data_line_bytes(
-                {
-                    "type": "response.output_item.added",
-                    "sequence_number": seq,
-                    "response_id": response_id,
-                    "output_index": 0,
-                    "item": {
-                        "type": "message",
-                        "id": message_item_id,
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
-                    },
-                }
-            )
-            seq += 1
-            try:
-                async for line in resp.aiter_lines():
-                    ls = (line or "").strip()
-                    if ls.startswith("data:"):
-                        raw = ls[len("data:") :].strip()
-                    elif ls.startswith("{"):
-                        # 少数上游直接每行一个 JSON，无 data: 前缀
-                        raw = ls
-                    else:
-                        continue
-                    if raw == "[DONE]":
-                        continue
-                    try:
-                        data_obj = json.loads(raw)
-                    except Exception:
-                        continue
-                    if not isinstance(data_obj, dict):
-                        continue
-                    _accumulate_chat_completion_chunk(state, data_obj)
-                    choices = data_obj.get("choices") or []
-                    ch0 = choices[0] if choices and isinstance(choices[0], dict) else {}
-                    delta = ch0.get("delta")
-                    if not isinstance(delta, dict):
-                        delta = {}
-                    rd = delta.get("reasoning_content")
-                    if rd is None:
-                        rd = delta.get("reasoning")
-                    # 只发 output_text.delta（与上方 output_item.added 的 message 同 output_index），
-                    # 不再单独发 reasoning_text.delta，避免与单 item 流式语义冲突导致 Codex 断开。
-                    if not skip_inline_deltas:
-                        if rd is not None and delta.get("content") is None:
-                            yield _sse_data_line_bytes(
-                                {
-                                    "type": "response.output_text.delta",
-                                    "response_id": response_id,
-                                    "delta": str(rd),
-                                    "item_id": message_item_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "sequence_number": seq,
-                                }
-                            )
-                            seq += 1
-                            had_output_text_delta = True
-                        if delta.get("content") is not None:
-                            yield _sse_data_line_bytes(
-                                {
-                                    "type": "response.output_text.delta",
-                                    "response_id": response_id,
-                                    "delta": str(delta.get("content")),
-                                    "item_id": message_item_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "sequence_number": seq,
-                                }
-                            )
-                            seq += 1
-                            had_output_text_delta = True
-            except Exception as exc:
-                stream_read_err = exc
-                _log(f"translate_sse upstream stream read error: {_short_text(exc)}")
-
-            msg = _accumulated_stream_state_to_message(state)
-            if stream_read_err:
-                c0 = str(msg.get("content") or "").strip()
-                r0 = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-                if not c0 and not r0:
-                    msg["content"] = f"[bridge] upstream stream aborted: {stream_read_err!s}"
-            r_full = str(state.get("reasoning_content") or "") + str(state.get("reasoning") or "")
-            ct = str(state.get("content") or "").strip()
-            out_done_text = ct if ct else r_full.strip()
-            if out_done_text:
-                # 上游只在最后一包带 message、无 delta 时，循环内可能从未发过 delta；Codex 要求先有 delta 再有 done。
-                if not had_output_text_delta:
-                    yield _sse_data_line_bytes(
-                        {
-                            "type": "response.output_text.delta",
-                            "response_id": response_id,
-                            "delta": out_done_text,
-                            "item_id": message_item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "sequence_number": seq,
-                        }
-                    )
-                    seq += 1
-                yield _sse_data_line_bytes(
-                    {
-                        "type": "response.output_text.done",
+            async for line in resp.aiter_lines():
+                ls = (line or "").strip()
+                if not ls.startswith("data:"):
+                    continue
+                raw = ls[len("data:") :].strip()
+                if raw == "[DONE]":
+                    continue
+                try:
+                    data_obj = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(data_obj, dict):
+                    continue
+                _accumulate_chat_completion_chunk(state, data_obj)
+                choices = data_obj.get("choices") or []
+                ch0 = choices[0] if choices and isinstance(choices[0], dict) else {}
+                delta = ch0.get("delta") if isinstance(ch0, dict) else {}
+                if isinstance(delta, dict) and delta.get("content"):
+                    ev = {
+                        "type": "response.output_text.delta",
                         "response_id": response_id,
-                        "item_id": message_item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "sequence_number": seq,
-                        "text": out_done_text,
+                        "delta": str(delta.get("content")),
                     }
-                )
-                seq += 1
+                    yield _sse_data_line_bytes(ev)
+            msg = _accumulated_stream_state_to_message(state)
             fake_chat = {
                 "id": f"chatcmpl_{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
@@ -1873,29 +1119,7 @@ async def _translate_chat_sse_to_response_sse(
                 fake_chat, model, parallel_tool_calls=parallel_tool_calls
             )
             conv["id"] = response_id
-            _truncate_resp_completed_reasoning_for_sse(conv)
-            msg_out: dict[str, Any] | None = None
-            for it in conv.get("output") or []:
-                if isinstance(it, dict) and str(it.get("type") or "").strip().lower() == "message":
-                    msg_out = it
-            if msg_out:
-                yield _sse_data_line_bytes(
-                    {
-                        "type": "response.output_item.done",
-                        "sequence_number": seq,
-                        "response_id": response_id,
-                        "output_index": 0,
-                        "item": msg_out,
-                    }
-                )
-                seq += 1
-            yield _sse_data_line_bytes(
-                {
-                    "type": "response.completed",
-                    "sequence_number": seq,
-                    "response": conv,
-                }
-            )
+            yield _sse_data_line_bytes({"type": "response.completed", "response": conv})
             yield b"data: [DONE]\n\n"
         finally:
             await _httpx_streaming_body_close(resp)
@@ -1904,7 +1128,6 @@ async def _translate_chat_sse_to_response_sse(
         gen(),
         status_code=200,
         media_type="text/event-stream; charset=utf-8",
-        headers=_sse_streaming_headers(),
     )
 
 
@@ -2054,7 +1277,7 @@ def _normalize_tools_for_vllm_responses(tools_value: Any) -> list[dict[str, Any]
     return out
 
 
-def _responses_payload_to_chat_payload(payload: dict[str, Any], model: str, app_state: Any = None, thinking_mode: bool = None) -> dict[str, Any]:
+def _responses_payload_to_chat_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
     chat_payload: dict[str, Any] = {
         "model": model,
         "messages": _responses_input_to_chat_messages(payload.get("input")),
@@ -2066,121 +1289,14 @@ def _responses_payload_to_chat_payload(payload: dict[str, Any], model: str, app_
 
     if "tool_choice" in payload and payload.get("tool_choice") is not None:
         chat_payload["tool_choice"] = payload.get("tool_choice")
-
-    def _cfg(name: str) -> Any:
-        if app_state is None:
-            return None
-        return getattr(app_state, name, None)
-
     if isinstance(payload.get("temperature"), (int, float)):
         chat_payload["temperature"] = payload.get("temperature")
-    else:
-        t = _cfg("config_temperature")
-        if isinstance(t, (int, float)):
-            chat_payload["temperature"] = t
-
     if isinstance(payload.get("top_p"), (int, float)):
         chat_payload["top_p"] = payload.get("top_p")
-    else:
-        tp = _cfg("config_top_p")
-        if isinstance(tp, (int, float)):
-            chat_payload["top_p"] = tp
-
-    if isinstance(payload.get("presence_penalty"), (int, float)):
-        chat_payload["presence_penalty"] = payload.get("presence_penalty")
-    else:
-        pp = _cfg("config_presence_penalty")
-        if isinstance(pp, (int, float)):
-            chat_payload["presence_penalty"] = pp
-
-    top_k = payload.get("top_k")
-    if isinstance(top_k, (int, float)) and top_k > 0:
-        chat_payload["top_k"] = int(top_k)
-    else:
-        tk = _cfg("config_top_k")
-        if isinstance(tk, (int, float)) and tk > 0:
-            chat_payload["top_k"] = int(tk)
-
     max_output_tokens = payload.get("max_output_tokens")
     if isinstance(max_output_tokens, int) and max_output_tokens > 0:
         chat_payload["max_tokens"] = max_output_tokens
-
-    # thinking：显式请求 > 调用参数 > llm_config（Codex 可能不带 enable_thinking，需靠桥接默认）
-    effective_thinking = thinking_mode
-    if effective_thinking is None and app_state is not None:
-        effective_thinking = _coerce_bool(getattr(app_state, "config_thinking_mode", None))
-    pe = payload.get("enable_thinking")
-    if pe is True:
-        effective_thinking = True
-    elif pe is False:
-        effective_thinking = False
-
-    if effective_thinking:
-        chat_payload["enable_thinking"] = True
-        reff = payload.get("reasoning_effort")
-        if isinstance(reff, str) and reff.strip():
-            chat_payload["reasoning_effort"] = reff.strip()
-        else:
-            chat_payload["reasoning_effort"] = "high"
-        _log(
-            f"thinking_mode enabled: enable_thinking=True, reasoning_effort={chat_payload.get('reasoning_effort')}"
-        )
-
     return chat_payload
-
-
-def _build_reasoning_item_for_responses(reasoning_text: str) -> dict[str, Any]:
-    """
-    OpenAI Responses 中 Reasoning 条目的规范形状：content 为 reasoning_text 片段列表
-    （见 API Reasoning 对象）。旧版仅用顶层 text 时，部分客户端无法渲染思考过程。
-    """
-    return {
-        "type": "reasoning",
-        "id": f"rs_{uuid.uuid4().hex[:10]}",
-        "summary": [],
-        "content": [{"type": "reasoning_text", "text": reasoning_text}],
-        "status": "completed",
-    }
-
-
-def _normalize_reasoning_items_in_response(resp: dict[str, Any]) -> dict[str, Any]:
-    """若上游 reasoning 只写了顶层 text、未写 content.reasoning_text，补全为官方形状。"""
-    if not isinstance(resp, dict):
-        return resp
-    out = resp.get("output")
-    if not isinstance(out, list):
-        return resp
-    changed = False
-    new_out: list[Any] = []
-    for item in out:
-        if not isinstance(item, dict):
-            new_out.append(item)
-            continue
-        if str(item.get("type") or "").strip().lower() != "reasoning":
-            new_out.append(item)
-            continue
-        has_rt = False
-        for p in item.get("content") or []:
-            if isinstance(p, dict) and str(p.get("type") or "").strip().lower() == "reasoning_text":
-                has_rt = True
-                break
-        if has_rt:
-            new_out.append(item)
-            continue
-        txt = item.get("text")
-        if isinstance(txt, str) and txt.strip():
-            it2 = dict(item)
-            it2["content"] = [{"type": "reasoning_text", "text": txt}]
-            it2.setdefault("status", "completed")
-            new_out.append(it2)
-            changed = True
-        else:
-            new_out.append(item)
-    if not changed:
-        return resp
-    r2 = dict(resp)
-    r2["output"] = new_out
-    return r2
 
 
 def _chat_completion_to_responses_payload(
@@ -2194,18 +1310,8 @@ def _chat_completion_to_responses_payload(
         message = {}
 
     output: list[dict[str, Any]] = []
-    
-    # 首先提取 reasoning（无论是否有工具调用）
-    reasoning_content = _extract_text_from_content(message.get("reasoning_content"))
-    if not reasoning_content:
-        reasoning_content = _extract_text_from_content(message.get("reasoning"))
-    
-    if reasoning_content:
-        output.append(_build_reasoning_item_for_responses(reasoning_content))
-
     tool_calls = message.get("tool_calls")
-    has_structured_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
-    if has_structured_tool_calls:
+    if isinstance(tool_calls, list) and tool_calls:
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -2234,8 +1340,7 @@ def _chat_completion_to_responses_payload(
                 }
             )
 
-    # 有 reasoning 时原先 `if not output` 为假，会漏掉助手正文；Codex 需要 `type: message` 才有正式回复。
-    if not has_structured_tool_calls:
+    if not output:
         content = _extract_text_from_content(message.get("content"))
         parsed_text_tc = _parse_loose_tool_call_text(content)
         if parsed_text_tc:
@@ -2251,20 +1356,15 @@ def _chat_completion_to_responses_payload(
                 }
             )
         else:
-            text_body = content if isinstance(content, str) else str(content or "")
-            # 思考模型常把全文放在 reasoning_content、content 为空；若此处不生成 message，
-            # Codex 主区域没有 output_text，会表现为「没有任何回复」。
-            display_text = text_body.strip() if text_body.strip() else (reasoning_content or "").strip()
-            if display_text or not reasoning_content:
-                output.append(
-                    {
-                        "type": "message",
-                        "id": f"msg_{uuid.uuid4().hex[:8]}",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": display_text}],
-                    }
-                )
+            output.append(
+                {
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": content}],
+                }
+            )
 
     usage_chat = chat_data.get("usage") if isinstance(chat_data.get("usage"), dict) else {}
     prompt_tokens = int((usage_chat or {}).get("prompt_tokens", 0) or 0)
@@ -2298,8 +1398,6 @@ def _extract_output_text(resp: dict[str, Any]) -> str:
         for item in output:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("type") or "").strip().lower() == "reasoning":
-                continue
             content = item.get("content")
             if isinstance(content, list):
                 for part in content:
@@ -2318,8 +1416,8 @@ def _extract_output_text(resp: dict[str, Any]) -> str:
         assistant_text = _extract_text_from_content(resp.get("output_text"))
     if reasoning_text:
         if assistant_text:
-            return f"{reasoning_text}\n\n{assistant_text}"
-        return reasoning_text
+            return f"<think>{reasoning_text}</think>\n{assistant_text}"
+        return f"<think>{reasoning_text}</think>"
     return assistant_text
 
 
@@ -2432,18 +1530,7 @@ def _resolve_upstream_authorization_header(
     return f"Bearer {tok}" if tok else "Bearer "
 
 
-def create_app(
-    upstream_base_url: str,
-    upstream_api_key: str,
-    default_model: str,
-    timeout_sec: float,
-    config_temperature: float = None,
-    config_thinking_mode: bool = None,
-    config_context_window: int = None,
-    config_top_p: float = None,
-    config_top_k: int = None,
-    config_presence_penalty: float = None,
-) -> Any:
+def create_app(upstream_base_url: str, upstream_api_key: str, default_model: str, timeout_sec: float) -> Any:
     _ensure_bridge_session_logging()
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse, Response
@@ -2464,18 +1551,6 @@ def create_app(
         application.state.upstream_chat_completions_url = chat_completions_url
         application.state.default_model = default_model
         application.state.upstream_api_key = upstream_api_key
-        # 保存配置参数
-        application.state.config_temperature = config_temperature
-        application.state.config_thinking_mode = config_thinking_mode
-        application.state.config_context_window = config_context_window
-        application.state.config_top_p = config_top_p
-        application.state.config_top_k = config_top_k
-        application.state.config_presence_penalty = config_presence_penalty
-        _log(
-            f"app.state.config_thinking_mode={config_thinking_mode} "
-            f"config_top_p={config_top_p} config_top_k={config_top_k} "
-            f"config_presence_penalty={config_presence_penalty}"
-        )
         application.state.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_sec, connect=10.0),
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
@@ -2496,8 +1571,7 @@ def create_app(
         f"responses_compat_chat={str(RESPONSES_COMPAT_CHAT_ENABLED).lower()} "
         f"responses_input_as_string={str(RESPONSES_INPUT_AS_STRING_ENABLED).lower()} "
         f"responses_input_string_retry={str(RESPONSES_INPUT_STRING_RETRY_ENABLED).lower()} "
-        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()} "
-        f"tui_sse_compat={str(CODEX_BRIDGE_TUI_SSE_COMPAT).lower()}"
+        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()}"
     )
 
     @app.get("/health")
@@ -2539,8 +1613,8 @@ def create_app(
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON object body is required")
 
-        raw_model = str(payload.get("model") or "").strip()
-        model, model_source, _ = _resolve_model_name(raw_model, app.state.default_model)
+        model = str(payload.get("model") or app.state.default_model).strip()
+        model_source = "payload" if str(payload.get("model") or "").strip() else "default"
         if not model:
             _log(f"req={req_id} rejected missing_model")
             raise HTTPException(status_code=400, detail="model is required")
@@ -2632,73 +1706,19 @@ def create_app(
             }
             if is_streaming_request:
                 sse_body = _build_minimal_response_sse(error_resp)
-                return _sse_pregenerated_text_as_streaming_response(sse_body)
+                return Response(
+                    content=sse_body, status_code=200,
+                    media_type="text/event-stream; charset=utf-8",
+                )
             return JSONResponse(status_code=200, content=error_resp)
 
         if RESPONSES_COMPAT_CHAT_ENABLED:
             compat_mode = "compat_stream" if is_streaming_request else "compat"
-            chat_payload = _responses_payload_to_chat_payload(proxied_payload, model, app.state)
+            chat_payload = _responses_payload_to_chat_payload(proxied_payload, model)
             _log(
                 f"req={req_id} responses_to_chat mode={compat_mode} tool_count={tools_count} "
                 f"message_count={len(chat_payload.get('messages') or [])}"
             )
-
-            # 客户端要求 stream 时优先走上游 chat.completions 真流式，便于 Codex 界面逐段刷新。
-            # 若请求带 tools：SSE transcode 未覆盖 function_call 等帧，Codex 会在 response.completed 前断开，改用非流式 + TUI SSE。
-            if is_streaming_request and RESPONSES_COMPAT_CHAT_STREAM_ENABLED and tools_count == 0:
-                stream_payload = dict(chat_payload)
-                stream_payload["stream"] = True
-                _log(
-                    f"req={req_id} responses_to_chat mode=compat_stream_try tool_count={tools_count} "
-                    f"message_count={len(stream_payload.get('messages') or [])}"
-                )
-                compat_r: Any = None
-                try:
-                    creq = app.state.client.build_request(
-                        "POST",
-                        app.state.upstream_chat_completions_url,
-                        json=stream_payload,
-                        headers=headers,
-                    )
-                    compat_r = await app.state.client.send(creq, stream=True)
-                except httpx.HTTPError as exc:
-                    elapsed_ms = int((time.time() - started_at) * 1000)
-                    _log(
-                        f"req={req_id} compat_stream_upstream_error latency_ms={elapsed_ms} "
-                        f"error={_short_text(exc)} fallback=compat_nonstream"
-                    )
-                else:
-                    if compat_r is not None and compat_r.status_code < 400:
-                        elapsed_ms = int((time.time() - started_at) * 1000)
-                        _log(
-                            f"req={req_id} compat_stream_ok latency_ms={elapsed_ms} model={model} "
-                            f"mode=responses_sse_transcode"
-                        )
-                        return await _translate_chat_sse_to_response_sse(
-                            compat_r,
-                            model,
-                            bool(proxied_payload.get("parallel_tool_calls", True)),
-                        )
-                    if compat_r is not None:
-                        err_raw = await compat_r.aread()
-                        await _httpx_streaming_body_close(compat_r)
-                        try:
-                            err_data = json.loads(err_raw.decode("utf-8")) if err_raw else {}
-                        except Exception:
-                            err_data = {"error": {"message": err_raw.decode("utf-8", errors="ignore")}}
-                        compat_err = _extract_upstream_error_message(
-                            err_data, err_raw.decode("utf-8", errors="ignore")
-                        )
-                        _log(
-                            f"req={req_id} compat_stream_status={compat_r.status_code} "
-                            f"error={_short_text(compat_err)} fallback=compat_nonstream"
-                        )
-            elif is_streaming_request and RESPONSES_COMPAT_CHAT_STREAM_ENABLED and tools_count > 0:
-                _log(
-                    f"req={req_id} compat_stream_skip reason=tools_present tool_count={tools_count} "
-                    f"fallback=compat_nonstream_tui_sse"
-                )
-
             try:
                 compat_resp = await app.state.client.post(
                     app.state.upstream_chat_completions_url, json=chat_payload, headers=headers
@@ -2723,22 +1743,21 @@ def create_app(
                     f"req={req_id} compat_done status=200 latency_ms={elapsed_ms} "
                     f"model={model} output_items={len(converted.get('output') or [])}"
                 )
-                _log_dialogue_transcript(
+                _log_interaction_json(
                     req_id,
-                    "responses.compat_chat",
-                    inbound_input=proxied_payload.get("input"),
-                    chat_payload=chat_payload,
-                    upstream_chat_completion=chat_data,
-                    converted_responses=converted,
-                    extra={"output_lines": _responses_output_full_lines(converted)},
+                    "responses.compat_chat_done",
+                    {
+                        "upstream_chat_completion": chat_data,
+                        "converted_responses": converted,
+                        "output_lines": _responses_output_full_lines(converted),
+                    },
                 )
                 if is_streaming_request:
-                    sse_body = (
-                        _build_codex_tui_compat_stream_sse(converted)
-                        if CODEX_BRIDGE_TUI_SSE_COMPAT
-                        else _build_minimal_response_sse(converted)
+                    sse_body = _build_minimal_response_sse(converted)
+                    return Response(
+                        content=sse_body, status_code=200,
+                        media_type="text/event-stream; charset=utf-8",
                     )
-                    return _sse_pregenerated_text_as_streaming_response(sse_body)
                 return JSONResponse(status_code=200, content=converted)
 
             compat_err = ""
@@ -2752,6 +1771,50 @@ def create_app(
             _log(
                 f"req={req_id} compat_status={compat_resp.status_code} latency_ms={elapsed_ms} "
                 f"error={_short_text(compat_err)} fallback=responses_passthrough"
+            )
+
+        if False and (
+            RESPONSES_COMPAT_CHAT_ENABLED
+            and is_streaming_request
+            and RESPONSES_COMPAT_CHAT_STREAM_ENABLED
+        ):
+            chat_payload = _responses_payload_to_chat_payload(proxied_payload, model)
+            chat_payload["stream"] = True
+            _log(
+                f"req={req_id} responses_to_chat mode=compat_stream_native tool_count={tools_count} "
+                f"message_count={len(chat_payload.get('messages') or [])}"
+            )
+            try:
+                creq = app.state.client.build_request(
+                    "POST", app.state.upstream_chat_completions_url, json=chat_payload, headers=headers
+                )
+                compat_r = await app.state.client.send(creq, stream=True)
+            except httpx.HTTPError as exc:
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                _log(f"req={req_id} compat_stream_upstream_error latency_ms={elapsed_ms} error={_short_text(exc)}")
+                raise HTTPException(
+                    status_code=502, detail=f"Upstream chat.completions stream failed: {exc}"
+                ) from exc
+            if compat_r.status_code < 400:
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                _log(
+                    f"req={req_id} compat_stream_ok latency_ms={elapsed_ms} model={model} mode=responses_sse_transcode"
+                )
+                return await _translate_chat_sse_to_response_sse(
+                    compat_r,
+                    model,
+                    bool(proxied_payload.get("parallel_tool_calls", True)),
+                )
+            err_raw = await compat_r.aread()
+            await _httpx_streaming_body_close(compat_r)
+            try:
+                err_data = json.loads(err_raw.decode("utf-8")) if err_raw else {}
+            except Exception:
+                err_data = {"error": {"message": err_raw.decode("utf-8", errors="ignore")}}
+            compat_err = _extract_upstream_error_message(err_data, err_raw.decode("utf-8", errors="ignore"))
+            _log(
+                f"req={req_id} compat_stream_status={compat_r.status_code} "
+                f"error={_short_text(compat_err)} fallback=responses_stream"
             )
 
         async def _open_responses_stream(body: dict[str, Any]) -> Any:
@@ -2879,25 +1942,14 @@ def create_app(
                         "output_items": _responses_output_full_lines(data),
                         "raw_response": data,
                     },
-                    max_str=_LOG_DIALOGUE_JSONL_MAX_STR,
-                )
-                _log_dialogue_transcript(
-                    req_id,
-                    "responses.stream_json_upstream",
-                    inbound_input=proxied_payload.get("input"),
-                    extra={
-                        "upstream_responses_output_plain": _responses_output_plain_text(data),
-                        "upstream_responses_json": data,
-                    },
                 )
                 data, converted_textual_tool = _normalize_response_tool_outputs(data)
-                data = _normalize_reasoning_items_in_response(data)
                 body_text = _build_minimal_response_sse(data)
                 if converted_textual_tool:
                     _log(f"req={req_id} coerced_text_tool_call mode=responses_stream model={model}")
                 else:
                     _log(f"req={req_id} wrapped_json_to_sse mode=responses_stream model={model}")
-                return _sse_pregenerated_text_as_streaming_response(body_text)
+                return Response(content=body_text, status_code=r.status_code, media_type="text/event-stream")
             _log(f"req={req_id} done status={r.status_code} latency_ms={elapsed_ms} model={model}")
             return Response(
                 content=raw_body,
@@ -3023,17 +2075,6 @@ def create_app(
                     "output_items": _responses_output_full_lines(data),
                     "raw_response": data,
                 },
-                max_str=_LOG_DIALOGUE_JSONL_MAX_STR,
-            )
-            _log_dialogue_transcript(
-                req_id,
-                "responses.passthrough_upstream",
-                inbound_input=proxied_payload.get("input"),
-                extra={
-                    "proxied_request_full": proxied_payload,
-                    "upstream_responses_output_plain": _responses_output_plain_text(data),
-                    "upstream_responses_json": data,
-                },
             )
         _log(
             f"req={req_id} done status={upstream_resp.status_code} latency_ms={elapsed_ms} "
@@ -3052,8 +2093,8 @@ def create_app(
             _log(f"req={req_id} invalid_json error={_short_text(exc)}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}") from exc
 
-        raw_model = str(payload.get("model") or "").strip()
-        model, model_source, _ = _resolve_model_name(raw_model, app.state.default_model)
+        model = str(payload.get("model") or app.state.default_model).strip()
+        model_source = "payload" if str(payload.get("model") or "").strip() else "default"
         if not model:
             _log(f"req={req_id} rejected missing_model")
             raise HTTPException(status_code=400, detail="model is required")
@@ -3141,45 +2182,12 @@ def create_app(
         max_tokens = payload.get("max_tokens")
         if isinstance(max_tokens, int) and max_tokens > 0:
             responses_payload["max_output_tokens"] = max_tokens
-        # 使用 payload 中的 temperature，如果没有则使用配置文件中的默认值
         temperature = payload.get("temperature")
-        if temperature is None and hasattr(app.state, "config_temperature") and app.state.config_temperature is not None:
-            temperature = app.state.config_temperature
         if isinstance(temperature, (int, float)):
             responses_payload["temperature"] = temperature
-        
-        # thinking_mode: 优先使用客户端请求中的 enable_thinking，其次使用配置文件
-        enable_thinking = payload.get("enable_thinking")
-        if enable_thinking is None and hasattr(app.state, "config_thinking_mode") and app.state.config_thinking_mode:
-            enable_thinking = True
-        
-        if enable_thinking is not None:
-            responses_payload["enable_thinking"] = enable_thinking
-            # 也保留 reasoning_effort 以兼容其他实现
-            if enable_thinking:
-                reasoning_effort = payload.get("reasoning_effort", "high")
-                responses_payload["reasoning_effort"] = reasoning_effort
-                _log(f"req={req_id} thinking_mode enabled: enable_thinking=True, reasoning_effort={reasoning_effort}")
-        
-        # context_window: 如果有设置，添加到 metadata 或作为额外参数
-        if hasattr(app.state, "config_context_window") and app.state.config_context_window:
-            responses_payload["context_window"] = app.state.config_context_window
         top_p = payload.get("top_p")
         if isinstance(top_p, (int, float)):
             responses_payload["top_p"] = top_p
-
-        # top_k: vLLM 扩展参数，需要通过 extra_body 传递
-        top_k = payload.get("top_k")
-        if isinstance(top_k, (int, float)) and top_k > 0:
-            # vLLM 要求 top_k 放在 extra_body 中
-            if "extra_body" not in responses_payload:
-                responses_payload["extra_body"] = {}
-            responses_payload["extra_body"]["top_k"] = int(top_k)
-
-        # presence_penalty: OpenAI 标准参数
-        presence_penalty = payload.get("presence_penalty")
-        if isinstance(presence_penalty, (int, float)):
-            responses_payload["presence_penalty"] = presence_penalty
 
         try:
             upstream_resp = await app.state.client.post(
@@ -3240,13 +2248,6 @@ def create_app(
                 f"completion_tokens={fallback_usage.get('completion_tokens', 0)} "
                 f"total_tokens={fallback_usage.get('total_tokens', 0)}"
             )
-            _log_dialogue_transcript(
-                req_id,
-                "chat_completions.fallback_direct",
-                inbound_input=messages,
-                chat_payload=fallback_payload,
-                upstream_chat_completion=fallback_data,
-            )
             return JSONResponse(status_code=200, content=fallback_data)
 
         if upstream_resp.status_code >= 400:
@@ -3285,18 +2286,6 @@ def create_app(
                 "assistant_text": assistant_text,
                 "usage": usage,
                 "upstream_responses_json": resp_data,
-            },
-            max_str=_LOG_DIALOGUE_JSONL_MAX_STR,
-        )
-        _log_dialogue_transcript(
-            req_id,
-            "chat_completions.from_upstream_responses",
-            inbound_input=responses_payload.get("input"),
-            extra={
-                "responses_payload": responses_payload,
-                "upstream_responses_json": resp_data,
-                "assistant_text_merged": assistant_text,
-                "openai_chat_completion_result": result,
             },
         )
         return JSONResponse(status_code=200, content=result)
@@ -3361,55 +2350,23 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _coerce_bool(value: Any) -> bool | None:
-    """Parse llm_config / env style booleans."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off", ""):
-        return False
-    return None
-
-
 def _ensure_bridge_config(args: argparse.Namespace) -> None:
     """Fill upstream_base_url / api_key / default_model from llm_config.json or ~/.codex."""
-    plugin_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "llm_config.json")
-    plugin_cfg: dict[str, Any] | None = None
-    if os.path.exists(plugin_config_path):
-        try:
-            with open(plugin_config_path, "r", encoding="utf-8") as f:
-                plugin_cfg = json.load(f)
-        except Exception as e:
-            _log(f"failed to read plugin llm_config.json: {e}")
-            plugin_cfg = None
-
-    if plugin_cfg:
-        if not getattr(args, "upstream_base_url", None):
-            args.upstream_base_url = plugin_cfg.get("api_base_url")
-        if not getattr(args, "upstream_api_key", None):
-            args.upstream_api_key = plugin_cfg.get("api_key", "dummy")
-        if not getattr(args, "default_model", None):
-            args.default_model = plugin_cfg.get("model_name")
-        # 与上游无关的桥接参数：即使 CLI 已指定上游 URL，也要从 llm_config 合并（否则 thinking_mode 等会丢失）
-        if getattr(args, "config_temperature", None) is None:
-            args.config_temperature = plugin_cfg.get("temperature")
-        if getattr(args, "config_thinking_mode", None) is None:
-            args.config_thinking_mode = _coerce_bool(plugin_cfg.get("thinking_mode"))
-        if getattr(args, "config_context_window", None) is None:
-            args.config_context_window = plugin_cfg.get("context_window")
-        if getattr(args, "config_top_p", None) is None:
-            args.config_top_p = plugin_cfg.get("top_p")
-        if getattr(args, "config_top_k", None) is None:
-            args.config_top_k = plugin_cfg.get("top_k")
-        if getattr(args, "config_presence_penalty", None) is None:
-            args.config_presence_penalty = plugin_cfg.get("presence_penalty")
-        _log(f"merged config from llm_config.json: {plugin_config_path}")
+    if not args.upstream_base_url or not args.upstream_api_key or not args.default_model:
+        plugin_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "llm_config.json")
+        if os.path.exists(plugin_config_path):
+            try:
+                with open(plugin_config_path, "r", encoding="utf-8") as f:
+                    plugin_cfg = json.load(f)
+                if not args.upstream_base_url:
+                    args.upstream_base_url = plugin_cfg.get("api_base_url")
+                if not args.upstream_api_key:
+                    args.upstream_api_key = plugin_cfg.get("api_key", "dummy")
+                if not args.default_model:
+                    args.default_model = plugin_cfg.get("model_name")
+                _log(f"loaded config from plugin llm_config.json: {plugin_config_path}")
+            except Exception as e:
+                _log(f"failed to load plugin llm_config.json: {e}")
 
     if args.use_codex_config:
         base_url, api_key, model = _load_codex_cli_config()
@@ -3432,32 +2389,15 @@ def create_asgi_app() -> Any:
         upstream_base_url=None,
         upstream_api_key=None,
         default_model=None,
-        timeout_sec=float(os.getenv("CODEX_BRIDGE_TIMEOUT_SEC", "999999")),
+        timeout_sec=120.0,
         use_codex_config=False,
-        config_temperature=None,
-        config_thinking_mode=None,
-        config_context_window=None,
-        config_top_p=None,
-        config_top_k=None,
-        config_presence_penalty=None,
     )
     _ensure_bridge_config(args)
     if not args.upstream_base_url or not args.upstream_api_key or not args.default_model:
         raise RuntimeError(
             "Missing upstream settings. Add llm_config.json next to the plugin or set CLI via python chat_bridge.py."
         )
-    return create_app(
-        args.upstream_base_url,
-        args.upstream_api_key,
-        args.default_model,
-        args.timeout_sec,
-        getattr(args, "config_temperature", None),
-        getattr(args, "config_thinking_mode", None),
-        getattr(args, "config_context_window", None),
-        getattr(args, "config_top_p", None),
-        getattr(args, "config_top_k", None),
-        getattr(args, "config_presence_penalty", None),
-    )
+    return create_app(args.upstream_base_url, args.upstream_api_key, args.default_model, args.timeout_sec)
 
 
 def _run_simple_server(
@@ -3467,12 +2407,6 @@ def _run_simple_server(
     upstream_api_key: str,
     default_model: str,
     timeout_sec: float,
-    config_temperature: float = None,
-    config_thinking_mode: bool = None,
-    config_context_window: int = None,
-    config_top_p: float = None,
-    config_top_k: int = None,
-    config_presence_penalty: float = None,
 ) -> None:
     import json as _json
     import urllib.request as _urlreq
@@ -3488,17 +2422,7 @@ def _run_simple_server(
         f"responses_compat_chat={str(RESPONSES_COMPAT_CHAT_ENABLED).lower()} "
         f"responses_input_as_string={str(RESPONSES_INPUT_AS_STRING_ENABLED).lower()} "
         f"responses_input_string_retry={str(RESPONSES_INPUT_STRING_RETRY_ENABLED).lower()} "
-        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()} "
-        f"tui_sse_compat={str(CODEX_BRIDGE_TUI_SSE_COMPAT).lower()}"
-    )
-
-    compat_app_state = SimpleNamespace(
-        config_temperature=config_temperature,
-        config_thinking_mode=config_thinking_mode,
-        config_context_window=config_context_window,
-        config_top_p=config_top_p,
-        config_top_k=config_top_k,
-        config_presence_penalty=config_presence_penalty,
+        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()}"
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -3634,8 +2558,8 @@ def _run_simple_server(
                 self._send_json(400, {"error": {"message": f"Invalid JSON body: {exc}"}})
                 return
 
-            raw_model = str(payload.get("model") or "").strip()
-            model, model_source, _ = _resolve_model_name(raw_model, default_model)
+            model = str(payload.get("model") or default_model).strip()
+            model_source = "payload" if str(payload.get("model") or "").strip() else "default"
             if not model:
                 _log(f"req={req_id} rejected missing_model")
                 self._send_json(400, {"error": {"message": "model is required"}})
@@ -3753,7 +2677,7 @@ def _run_simple_server(
 
                 if RESPONSES_COMPAT_CHAT_ENABLED:
                     compat_mode = "compat_stream" if is_streaming_request else "compat"
-                    compat_payload = _responses_payload_to_chat_payload(proxied_payload, model, compat_app_state)
+                    compat_payload = _responses_payload_to_chat_payload(proxied_payload, model)
                     _log(
                         f"req={req_id} responses_to_chat mode={compat_mode} tool_count={tools_count} "
                         f"message_count={len(compat_payload.get('messages') or [])}"
@@ -3787,21 +2711,8 @@ def _run_simple_server(
                             f"req={req_id} compat_done status=200 latency_ms={elapsed_ms} "
                             f"model={model} output_items={len(converted.get('output') or [])}"
                         )
-                        _log_dialogue_transcript(
-                            req_id,
-                            "responses.compat_chat",
-                            inbound_input=proxied_payload.get("input"),
-                            chat_payload=compat_payload,
-                            upstream_chat_completion=compat_json,
-                            converted_responses=converted,
-                        )
                         if is_streaming_request:
-                            sse_raw = (
-                                _build_codex_tui_compat_stream_sse(converted)
-                                if CODEX_BRIDGE_TUI_SSE_COMPAT
-                                else _build_minimal_response_sse(converted)
-                            )
-                            sse_body = sse_raw.encode("utf-8")
+                            sse_body = _build_minimal_response_sse(converted).encode("utf-8")
                             self.send_response(200)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                             self.send_header("Content-Length", str(len(sse_body)))
@@ -3946,7 +2857,6 @@ def _run_simple_server(
                         parsed_stream, converted_textual_tool = _normalize_response_tool_outputs(
                             parsed_stream
                         )
-                        parsed_stream = _normalize_reasoning_items_in_response(parsed_stream)
                         body = _build_minimal_response_sse(parsed_stream).encode("utf-8")
                         headers = dict(headers)
                         headers["Content-Type"] = "text/event-stream; charset=utf-8"
@@ -3965,7 +2875,6 @@ def _run_simple_server(
                             completed, converted_textual_tool = _normalize_response_tool_outputs(
                                 completed
                             )
-                            completed = _normalize_reasoning_items_in_response(completed)
                             if converted_textual_tool:
                                 body = _build_minimal_response_sse(completed).encode("utf-8")
                                 headers = dict(headers)
@@ -4012,45 +2921,12 @@ def _run_simple_server(
             max_tokens = payload.get("max_tokens")
             if isinstance(max_tokens, int) and max_tokens > 0:
                 responses_payload["max_output_tokens"] = max_tokens
-            # 使用 payload 中的 temperature，如果没有则使用配置文件中的默认值
             temperature = payload.get("temperature")
-            if temperature is None and hasattr(app.state, "config_temperature") and app.state.config_temperature is not None:
-                temperature = app.state.config_temperature
             if isinstance(temperature, (int, float)):
                 responses_payload["temperature"] = temperature
-            
-            # thinking_mode: 优先使用客户端请求中的 enable_thinking，其次使用配置文件
-            enable_thinking = payload.get("enable_thinking")
-            if enable_thinking is None and hasattr(app.state, "config_thinking_mode") and app.state.config_thinking_mode:
-                enable_thinking = True
-            
-            if enable_thinking is not None:
-                responses_payload["enable_thinking"] = enable_thinking
-                # 也保留 reasoning_effort 以兼容其他实现
-                if enable_thinking:
-                    reasoning_effort = payload.get("reasoning_effort", "high")
-                    responses_payload["reasoning_effort"] = reasoning_effort
-                    _log(f"req={req_id} thinking_mode enabled: enable_thinking=True, reasoning_effort={reasoning_effort}")
-            
-            # context_window: 如果有设置，添加到 metadata 或作为额外参数
-            if hasattr(app.state, "config_context_window") and app.state.config_context_window:
-                responses_payload["context_window"] = app.state.config_context_window
             top_p = payload.get("top_p")
             if isinstance(top_p, (int, float)):
                 responses_payload["top_p"] = top_p
-
-            # top_k: vLLM 扩展参数，需要通过 extra_body 传递
-            top_k = payload.get("top_k")
-            if isinstance(top_k, (int, float)) and top_k > 0:
-                # vLLM 要求 top_k 放在 extra_body 中
-                if "extra_body" not in responses_payload:
-                    responses_payload["extra_body"] = {}
-                responses_payload["extra_body"]["top_k"] = int(top_k)
-
-            # presence_penalty: OpenAI 标准参数
-            presence_penalty = payload.get("presence_penalty")
-            if isinstance(presence_penalty, (int, float)):
-                responses_payload["presence_penalty"] = presence_penalty
 
             try:
                 status, headers, body = _post_json(responses_url, responses_payload)
@@ -4129,88 +3005,12 @@ def _run_simple_server(
     server.serve_forever()
 
 
-def _kill_process_on_port(port: int) -> None:
-    """Kill any process listening on the given port (cross-platform)."""
-    import subprocess
-    import signal
-    
-    try:
-        # Try lsof first (macOS/Linux)
-        result = subprocess.run(
-            ["lsof", "-ti", f":{port}"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            pids = result.stdout.strip().split("\n")
-            for pid_str in pids:
-                try:
-                    pid = int(pid_str.strip())
-                    _log(f"killing process {pid} using port {port}")
-                    os.kill(pid, signal.SIGTERM)
-                except (ValueError, ProcessLookupError, PermissionError) as e:
-                    _log(f"failed to kill pid {pid}: {e}")
-            # Wait a moment for graceful shutdown
-            time.sleep(0.5)
-            return
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    
-    # Fallback to fuser (Linux)
-    try:
-        result = subprocess.run(
-            ["fuser", "-k", f"{port}/tcp"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            _log(f"killed process on port {port} using fuser")
-            time.sleep(0.5)
-            return
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    
-    # Fallback to netstat + taskkill (Windows)
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            for line in result.stdout.split("\n"):
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        pid = parts[-1]
-                        try:
-                            pid_int = int(pid)
-                            _log(f"killing windows process {pid_int} on port {port}")
-                            subprocess.run(
-                                ["taskkill", "/PID", str(pid_int), "/F"],
-                                capture_output=True,
-                                timeout=5
-                            )
-                        except (ValueError, subprocess.TimeoutExpired):
-                            pass
-                    break
-            time.sleep(0.5)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-
-
 def main() -> None:
     args = _parse_args()
     _ensure_bridge_config(args)
 
     if not args.upstream_base_url or not args.upstream_api_key or not args.default_model:
         raise RuntimeError("Missing upstream settings (base_url/api_key/model). Provide args or use --use-codex-config or ensure llm_config.json exists.")
-
-    # Kill any process using the target port before starting
-    _kill_process_on_port(args.port)
 
     base_v1, responses_url, _, chat_completions_url = _normalize_base_urls(args.upstream_base_url)
     _log(
@@ -4222,24 +3022,12 @@ def main() -> None:
         f"default_model={args.default_model} responses_compat_chat={str(RESPONSES_COMPAT_CHAT_ENABLED).lower()} "
         f"responses_input_as_string={str(RESPONSES_INPUT_AS_STRING_ENABLED).lower()} "
         f"responses_input_string_retry={str(RESPONSES_INPUT_STRING_RETRY_ENABLED).lower()} "
-        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()} "
-        f"tui_sse_compat={str(CODEX_BRIDGE_TUI_SSE_COMPAT).lower()}"
+        f"compat_chat_stream={str(RESPONSES_COMPAT_CHAT_STREAM_ENABLED).lower()}"
     )
 
     try:
         import uvicorn  # noqa: F401
-        app = create_app(
-            args.upstream_base_url,
-            args.upstream_api_key,
-            args.default_model,
-            args.timeout_sec,
-            getattr(args, "config_temperature", None),
-            getattr(args, "config_thinking_mode", None),
-            getattr(args, "config_context_window", None),
-            getattr(args, "config_top_p", None),
-            getattr(args, "config_top_k", None),
-            getattr(args, "config_presence_penalty", None),
-        )
+        app = create_app(args.upstream_base_url, args.upstream_api_key, args.default_model, args.timeout_sec)
         import uvicorn
 
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -4252,12 +3040,6 @@ def main() -> None:
             args.upstream_api_key,
             args.default_model,
             args.timeout_sec,
-            getattr(args, "config_temperature", None),
-            getattr(args, "config_thinking_mode", None),
-            getattr(args, "config_context_window", None),
-            getattr(args, "config_top_p", None),
-            getattr(args, "config_top_k", None),
-            getattr(args, "config_presence_penalty", None),
         )
 
 

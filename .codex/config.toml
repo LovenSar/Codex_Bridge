@@ -9,12 +9,17 @@
 # 说明：内置 model_provider=openai + openai_base_url 时，Codex 可能用 WebSocket 访问
 # ws://.../v1/responses，而 chat_bridge 仅支持 HTTP POST，会 404。下面用自定义 provider
 # 并设置 supports_websockets = false，强制走 HTTPS Responses。
+#
+# Thinking 模式配置（官方推荐）：
+#   - 通用场景：temp=1.0、top_p=0.95、top_k=20、presence_penalty=1.5
+#   - 精确编码：temp=0.6（其他参数同上）
 
 [profiles]
 
 [profiles.bridge]
 model_provider = "code_bridge_http"
 model = "Qwen/Qwen3.5-27B"
+model_reasoning_effort = "high"
 
 [profiles.upstream-openai]
 model_provider = "openai"
@@ -26,4 +31,7 @@ base_url = "http://127.0.0.1:18081/v1"
 wire_api = "responses"
 supports_websockets = false
 requires_openai_auth = true
+
+# Thinking 模式参数（通用场景）；Codex 要求 query_params 值为字符串
+query_params = { temperature = "1.0", top_p = "0.95", top_k = "20", presence_penalty = "1.5" }
 

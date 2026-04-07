@@ -3,7 +3,10 @@
   "api_key": "dummy",
   "model_name": "Qwen/Qwen3.5-27B",
   "context_window": 256000,
-  "temperature": 0.2,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "presence_penalty": 1.5,
   "max_tokens": 4096,
   "thinking_mode": true,
   "batch_size": 0,
@@ -17,5 +20,16 @@
     "model_name": "Qwen/Qwen3.5-27B",
     "api_base_url": "http://100.122.242.51:8000/v1"
   },
-  "tool_mode": "prompt"
+  "tool_mode": "prompt",
+  "thinking_modes": {
+    "default": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "presence_penalty": 1.5
+    },
+    "exact_coding": {
+      "temperature": 0.6
+    }
+  }
 }
