@@ -1,0 +1,10 @@
+{
+  "model": "Qwen/Qwen3.5-27B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, how are you?"
+    }
+  ],
+  "max_tokens": 50
+}
