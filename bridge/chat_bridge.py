@@ -283,6 +283,18 @@ def _emit_console_dialogue_summary(
                 if isinstance(msg, dict) and not reply:
                     reply = str(msg.get("content") or "")
 
+    # 助手正文与思考：仅旧式字符串拼接，思考接在助手回复末尾（不再单独开 [思考 / reasoning] 区块）
+    reply_st = reply.strip() if isinstance(reply, str) else str(reply or "").strip()
+    reason_st = reason.strip() if isinstance(reason, str) else str(reason or "").strip()
+    if reply_st and reason_st:
+        reply_block = reply_st + "\n\n" + reason_st
+    elif reply_st:
+        reply_block = reply_st
+    elif reason_st:
+        reply_block = reason_st
+    else:
+        reply_block = "(无)"
+
     lines = [
         "",
         "╔" + "═" * 70 + "╗",
@@ -291,11 +303,8 @@ def _emit_console_dialogue_summary(
         "[用户发送]",
         user_txt if user_txt.strip() else "(无)",
         "",
-        "[思考 / reasoning]",
-        reason if reason.strip() else "(无)",
-        "",
         "[助手回复]",
-        reply if reply.strip() else "(无)",
+        reply_block,
         "",
     ]
     text = "\n".join(lines)
@@ -305,8 +314,8 @@ def _emit_console_dialogue_summary(
     if not _CONSOLE_DIALOGUE_BANNER_SHOWN:
         _CONSOLE_DIALOGUE_BANNER_SHOWN = True
         _log(
-            "提示：以下 [用户发送]/[思考]/[助手回复] 出现在「运行 python chat_bridge.py 的终端」；"
-            "Codex 界面是另一个进程，不会在这里显示。"
+            "提示：以下 [用户发送]/[助手回复] 出现在「运行 python chat_bridge.py 的终端」；"
+            "思考内容已拼在 [助手回复] 末尾。Codex 界面是另一个进程，不会在这里显示。"
         )
     _log(text)
 
@@ -2194,17 +2203,18 @@ def _chat_completion_to_responses_payload(
         message = {}
 
     output: list[dict[str, Any]] = []
-    
-    # 首先提取 reasoning（无论是否有工具调用）
+
     reasoning_content = _extract_text_from_content(message.get("reasoning_content"))
     if not reasoning_content:
         reasoning_content = _extract_text_from_content(message.get("reasoning"))
-    
-    if reasoning_content:
-        output.append(_build_reasoning_item_for_responses(reasoning_content))
 
     tool_calls = message.get("tool_calls")
     has_structured_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+
+    # 仅有工具调用时仍单独挂 reasoning 条目（此路径不生成普通 message 正文）。
+    # 普通对话：思考与正文合并进 message 的 output_text，避免 Codex clean 里出现「正文+思考」两套。
+    if reasoning_content and has_structured_tool_calls:
+        output.append(_build_reasoning_item_for_responses(reasoning_content))
     if has_structured_tool_calls:
         for tc in tool_calls:
             if not isinstance(tc, dict):
@@ -2252,10 +2262,18 @@ def _chat_completion_to_responses_payload(
             )
         else:
             text_body = content if isinstance(content, str) else str(content or "")
-            # 思考模型常把全文放在 reasoning_content、content 为空；若此处不生成 message，
-            # Codex 主区域没有 output_text，会表现为「没有任何回复」。
-            display_text = text_body.strip() if text_body.strip() else (reasoning_content or "").strip()
-            if display_text or not reasoning_content:
+            body_st = text_body.strip() if text_body.strip() else ""
+            reason_st = (reasoning_content or "").strip()
+            # 与终端摘要一致：正文与思考旧式拼接，一并推给 Codex 的 output_text（clean 里只见一段）
+            if body_st and reason_st:
+                display_text = body_st + "\n\n" + reason_st
+            elif body_st:
+                display_text = body_st
+            elif reason_st:
+                display_text = reason_st
+            else:
+                display_text = ""
+            if display_text or not reason_st:
                 output.append(
                     {
                         "type": "message",
