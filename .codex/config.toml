@@ -1,18 +1,10 @@
-# Codex 项目级配置（与本目录 llm_config.json 配套使用）
-# 联调验证：codex-cli 0.118.0（codex --version）
+# Codex Bridge - 项目级配置
+# 联调验证：codex-cli 0.118.0+
 #
 # 使用前先启动桥：python chat_bridge.py
 # llm_config.json 的 api_base_url 应指向「真实上游 LLM」，不要填本桥端口（避免自环）。
 #
-# 在本目录下运行：codex -p bridge
-#
-# 说明：内置 model_provider=openai + openai_base_url 时，Codex 可能用 WebSocket 访问
-# ws://.../v1/responses，而 chat_bridge 仅支持 HTTP POST，会 404。下面用自定义 provider
-# 并设置 supports_websockets = false，强制走 HTTPS Responses。
-#
-# Thinking 模式配置（官方推荐）：
-#   - 通用场景：temp=1.0、top_p=0.95、top_k=20、presence_penalty=1.5
-#   - 精确编码：temp=0.6（其他参数同上）
+# 运行：codex -p bridge
 
 [profiles]
 
@@ -26,12 +18,9 @@ model_provider = "openai"
 model = "gpt-5.4"
 
 [model_providers.code_bridge_http]
-name = "Code Bridge (HTTP Responses only)"
-base_url = "http://127.0.0.1:18081/v1"
+name = "Code Bridge"
+base_url = "https://127.0.0.1:18081/v1"
 wire_api = "responses"
 supports_websockets = false
 requires_openai_auth = true
-
-# Thinking 模式参数（通用场景）；Codex 要求 query_params 值为字符串
 query_params = { temperature = "1.0", top_p = "0.95", top_k = "20", presence_penalty = "1.5" }
-

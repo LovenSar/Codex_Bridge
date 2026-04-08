@@ -1,6 +1,32 @@
+# Runtime logs
 logs/
 
+# TLS certificates (auto-generated)
+.certs/
+
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Codex runtime
+.codex/log/
+.codex/.personality_migration
+
+# Go binaries
 *.exe
 *.exe~
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store

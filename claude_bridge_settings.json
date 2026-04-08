@@ -1,0 +1,18 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:28082",
+    "ANTHROPIC_API_KEY": "dummy",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_MODEL": "Qwen/Qwen3.5-27B",
+    "ANTHROPIC_SMALL_FAST_MODEL": "Qwen/Qwen3.5-27B",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "Qwen/Qwen3.5-27B",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "Qwen/Qwen3.5-27B",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Qwen/Qwen3.5-27B",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "alwaysThinkingEnabled": true,
+  "skipDangerousModePermissionPrompt": true
+}

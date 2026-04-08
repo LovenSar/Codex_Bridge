@@ -1,191 +1,269 @@
-# Code_Bridge（Codex Chat Bridge）
+# Codex Bridge
 
-**OpenAI 兼容 HTTP 桥**：在 `127.0.0.1:18081` 提供 `/v1/chat/completions`、`/v1/responses` 等，把 **Codex CLI**（及同类客户端）接到 **只暴露部分 API 的上游**（例如仅 [Responses API](https://platform.openai.com/docs/api-reference/responses)）。**生产用 `bridge/chat_bridge.py`（Python）**；Go 版见文末。
-
-| 场景 | 处理 |
-|------|------|
-| API 形态不一致 | 上游只有 `/v1/responses`，客户端仍走 Chat Completions 等 → 本地 **转换与转发**。 |
-| Codex 与 WebSocket | 内置 `openai` provider 可能走 `ws://.../v1/responses`；本桥仅 **HTTP POST**。自定义 provider（`.codex/config.toml`）设 `supports_websockets = false`，由桥与上游 HTTP 通信。 |
-| 配置自环 | `llm_config.json` 的 `api_base_url` 填 **真实上游**，不要填本桥端口。 |
+本地 HTTP 桥，将 **Codex CLI** 和 **Claude Code CLI** 同时接到自定义上游 LLM（如 vLLM、Ollama 等 OpenAI 兼容后端）。
 
 ```mermaid
 flowchart LR
-  A["Codex CLI 等"]
-  B["chat_bridge.py<br/>127.0.0.1:18081 /v1/*"]
-  C["上游 LLM<br/>llm_config.json"]
+  A["Codex CLI"]
+  B["Claude Code CLI"]
+  C["chat_bridge.py"]
+  D["上游 LLM<br/>(vLLM / Ollama 等)"]
 
-  A -->|"HTTP"| B
-  B -->|"转发/转换"| C
+  A -->|"HTTPS :18081<br/>Responses API"| C
+  B -->|"HTTP :28082<br/>Messages API"| C
+  C -->|"转发 / 转换"| D
 ```
 
-实现细节（流式 SSE、工具多轮等）见 `bridge/chat_bridge.py` 顶部与代码。
+## 核心特性
+
+| 特性 | 说明 |
+|------|------|
+| 双端口监听 | **18081**（HTTPS，OpenAI Responses API）+ **28082**（HTTP，Anthropic Messages API） |
+| 协议转换 | Chat Completions ↔ Responses ↔ Anthropic Messages，自动适配上游格式 |
+| 自签名 TLS | 启动时自动生成证书并安装到 Windows 信任库，Codex CLI 开箱即用 |
+| WebSocket 降级 | 优雅接受并关闭 WebSocket 连接，Codex CLI 自动 fallback 到 HTTP POST |
+| Thinking 模式 | 支持 `enable_thinking` / `reasoning_effort`，reasoning token 正确传递 |
+| 工具调用 | 多轮 function_call 转换，循环检测保护（默认 40 轮） |
+| 流式 SSE | OpenAI SSE → Anthropic SSE 双向翻译 |
 
 ---
 
 ## 仓库结构
 
-| 路径 | 说明 |
-|------|------|
-| `chat_bridge.py` | 入口：将 `bridge` 加入 `PYTHONPATH` 后调用 `bridge/chat_bridge.py` 的 `main()`。 |
-| `bridge/chat_bridge.py` | **主实现**：FastAPI + Uvicorn；缺依赖时 **ThreadingHTTPServer**（simple-http）。 |
-| `bridge/requirements.txt` | `fastapi`、`httpx`、`uvicorn`。 |
-| `llm_config.json` | 上游地址、Key、默认模型；未传参时由桥读取。 |
-| `.codex/config.toml` | Codex 示例：自定义 provider → `http://127.0.0.1:18081/v1`，关闭 WebSocket。 |
-| `bridge/chat_bridge.go` | Go 版（对比用）。 |
-| `bridge/stress_test/`、`bridge/stress_test.ps1` | 压测（可选）。 |
-| `handler/codex_handler.go`、`plugin_spec.go` | 嵌入自有服务时的插件与路由示例。 |
-| `logs/` | 会话日志等（若启用）。 |
-
----
-
-## 环境
-
-- Python **3.10+**
-- 可访问的上游 OpenAI 兼容 API（`llm_config.json` 或命令行）
-- **Codex 联调验证**：`codex-cli 0.118.0`（`codex --version`；其它版本自行验证）
+```
+Codex_Bridge/
+├── chat_bridge.py              # 入口（调用 bridge/chat_bridge.py）
+├── bridge/
+│   ├── chat_bridge.py          # 主实现：FastAPI + Uvicorn
+│   ├── chat_bridge.go          # Go 版（实验性，仅供对比）
+│   ├── requirements.txt        # Python 依赖
+│   ├── start_bridge.bat        # Windows 快捷启动
+│   ├── stress_test.ps1         # PowerShell 压测脚本
+│   └── stress_test/            # Go 压测
+├── llm_config.json             # 上游 LLM 配置（地址、Key、模型、参数）
+├── .codex/config.toml          # Codex CLI 项目级 profile
+├── claude_bridge_settings.json # Claude Code CLI 配置模板
+├── handler/codex_handler.go    # 插件路由示例（可选）
+├── plugin_spec.go              # 插件元数据（可选）
+└── .gitignore
+```
 
 ---
 
 ## 快速开始
 
+### 1. 安装依赖
+
 ```bash
 pip install -r bridge/requirements.txt
+```
+
+### 2. 配置上游
+
+编辑 `llm_config.json`，指向你的 **真实上游 LLM**（不要填本桥端口）：
+
+```json
+{
+  "api_base_url": "http://your-vllm-server:8000/v1",
+  "api_key": "your-key",
+  "model_name": "Qwen/Qwen3.5-27B"
+}
+```
+
+### 3. 启动桥
+
+```bash
 python chat_bridge.py
 ```
 
-未传参时从项目根 `llm_config.json` 补全 `--upstream-base-url`、`--upstream-api-key`、`--default-model`。也可：
+桥会同时监听：
+- **https://127.0.0.1:18081** — Codex CLI（OpenAI Responses API）
+- **http://127.0.0.1:28082** — Claude Code CLI（Anthropic Messages API）
+
+也可通过参数启动：
 
 ```bash
-python bridge/chat_bridge.py ^
-  --host 127.0.0.1 --port 18081 ^
-  --upstream-base-url http://上游:端口/v1 ^
-  --upstream-api-key 密钥 ^
-  --default-model 模型名
+python bridge/chat_bridge.py \
+  --host 127.0.0.1 --port 18081 \
+  --claude-code-port 28082 \
+  --upstream-base-url http://your-server:8000/v1 \
+  --upstream-api-key your-key \
+  --default-model Qwen/Qwen3.5-27B
 ```
 
-`--use-codex-config` 可从 `~/.codex` 加载上游（见 `_load_codex_cli_config`）。
-
-**自检**：
+### 4. 验证
 
 ```bash
-curl http://127.0.0.1:18081/health
-curl http://127.0.0.1:18081/v1/models
+curl -k https://127.0.0.1:18081/health
+curl http://127.0.0.1:28082/health
 ```
-
-健康检查为 JSON（`status`、`upstream_base_v1` 等）；FastAPI 与 simple-http 字段可能略有差异。
 
 ---
 
 ## 与 Codex CLI 配合
 
-在 **`codex-cli 0.118.0`** 下联调通过；其它版本请自行验证。
+### 全局配置（推荐）
 
-1. 启动本桥。
-2. 使用 `.codex/config.toml` 中 **`profiles.bridge`**：`model_provider = "code_bridge_http"` → `[model_providers.code_bridge_http]`，`base_url = "http://127.0.0.1:18081/v1"`，`wire_api = "responses"`，`supports_websockets = false`。
-3. 在含该配置的仓库根执行：`codex -p bridge`。
-
-`llm_config.json` 仍指向 **真实上游**；桥只在本机监听。
-
-### 信任项目（否则 `config profile 'bridge' not found`）
-
-Codex 仅在 **受信任项目** 加载仓库内 `.codex/config.toml`。在用户级 **`%USERPROFILE%\.codex\config.toml`**（Windows）或 **`~/.codex/config.toml`** 增加（路径改为你的仓库绝对路径，TOML 键加引号）：
+编辑 `~/.codex/config.toml`：
 
 ```toml
-[projects."E:/WorkSpace/Code_Bridge"]
-trust_level = "trusted"
+model_provider = "codex_bridge"
+model = "Qwen/Qwen3.5-27B"
+
+[model_providers.codex_bridge]
+name = "codex_bridge"
+base_url = "https://127.0.0.1:18081/v1"
+wire_api = "responses"
+requires_openai_auth = true
 ```
 
-保存后在仓库根重试 `codex -p bridge`。也可在 Codex UI 中「信任此项目」。
+确保 `~/.codex/auth.json` 存在（key 可以是任意值）：
 
-### 项目根
-
-默认向上查找含 **`.git`** 的目录为项目根。无 Git 可在根目录 `git init`，或用户级配置 `project_root_markers`（[高级配置](https://developers.openai.com/codex/config-advanced/)）。
-
-### `--yolo`
-
-只影响审批与沙箱，**不**等同于信任，**不**单独加载项目 `.codex/config.toml`。
-
-### 不配信任时
-
-把 `.codex/config.toml` 里的 **`[profiles.bridge]`** 与 **`[model_providers.code_bridge_http]`** 整段复制到 **`~/.codex/config.toml`**，`-p bridge` 可不依赖项目层加载（与团队配置冲突时自行合并）。
-
-### Qwen/Qwen3.5-27B 与用户级 `model_providers`
-
-`llm_config.json` 常有 `context_window = 256000` 时，在用户级 `~/.codex/config.toml` 为指向本桥的 provider 对齐窗口与压缩阈值；段名与 `model_provider` 一致（仓库用 `code_bridge_http` 则段名为 `[model_providers.code_bridge_http]`）。须与仓库 provider 段中的 **`wire_api` / `supports_websockets` / `requires_openai_auth`** 等同段或合并一致。
-
-```toml
-[model_providers.bridge]
-name = "bridge"
-base_url = "http://127.0.0.1:18081/v1"
-network_access = "enabled"
-model_context_window = 256000
-model_auto_compact_token_limit = 245000
-disable_response_storage = true
+```json
+{"OPENAI_API_KEY": "dummy"}
 ```
 
-| 字段 | 说明 |
-|------|------|
-| `base_url` | 与 `python chat_bridge.py --port` 一致。 |
-| `network_access` | 需联网工具时常设为 `"enabled"`。 |
-| `model_context_window` | 与 `llm_config.json` 的 `context_window` 对齐示例。 |
-| `model_auto_compact_token_limit` | 略小于窗口，留余量触发压缩。 |
-| `disable_response_storage` | 按需关闭响应落盘。 |
+然后直接运行：
 
-缺少 `wire_api = "responses"`、`supports_websockets = false` 等仍可能走错协议；键名以 [Codex 配置参考](https://developers.openai.com/codex/config-reference/) 为准。
+```bash
+codex --yolo
+```
+
+### 项目级配置
+
+本仓库已包含 `.codex/config.toml`。信任项目后运行：
+
+```bash
+codex -p bridge
+```
 
 ---
 
-## HTTP 端点（Python 桥）
+## 与 Claude Code CLI 配合
 
-| 路径 | 说明 |
-|------|------|
-| `GET /health` | 健康与上游基址 |
-| `GET /v1/models` | 模型列表（常代理上游） |
-| `POST /v1/responses` | Responses |
-| `POST /v1/chat/completions` | Chat Completions（可与 Responses 互转） |
+### 方法 1：修改全局 settings（推荐）
 
-路由见 `create_app`、`_run_simple_server` 内 `Handler`。
+将 `claude_bridge_settings.json` 复制到 `~/.claude/settings.json`：
+
+```powershell
+Copy-Item claude_bridge_settings.json $env:USERPROFILE\.claude\settings.json
+```
+
+然后直接运行：
+
+```bash
+claude
+```
+
+### 方法 2：环境变量
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:28082"
+$env:ANTHROPIC_API_KEY = "dummy"
+$env:ANTHROPIC_AUTH_TOKEN = "dummy"
+$env:ANTHROPIC_MODEL = "Qwen/Qwen3.5-27B"
+claude
+```
+
+> **注意**：`~/.claude/settings.json` 中的 `env` 优先级高于 shell 环境变量。
+
+### 切换回真实 Claude API
+
+```powershell
+# 备份桥配置
+Copy-Item $env:USERPROFILE\.claude\settings.json $env:USERPROFILE\.claude\settings.bridge.json
+
+# 恢复真实 API 配置
+Copy-Item $env:USERPROFILE\.claude\settings.json.bak $env:USERPROFILE\.claude\settings.json
+```
 
 ---
 
-## 环境变量（节选）
+## 命令行参数
 
-| 变量 | 作用 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--host` | `127.0.0.1` | 监听地址 |
+| `--port` | `18081` | Codex 端口（HTTPS） |
+| `--claude-code-port` | `28082` | Claude Code 端口（HTTP），`0` 禁用 |
+| `--upstream-base-url` | 从 `llm_config.json` | 上游 API 地址 |
+| `--upstream-api-key` | 从 `llm_config.json` | 上游 API Key |
+| `--default-model` | 从 `llm_config.json` | 默认模型 |
+| `--timeout-sec` | `120` | 上游请求超时 |
+| `--ssl` / `--no-ssl` | `--ssl` | 是否启用 HTTPS（自签名证书） |
+
+---
+
+## HTTP 端点
+
+### 18081 端口（Codex CLI）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查 |
+| GET | `/v1/models` | 模型列表 |
+| POST | `/v1/responses` | OpenAI Responses API |
+| POST | `/v1/chat/completions` | Chat Completions |
+| WS | `/v1/responses` | WebSocket（优雅关闭，触发 HTTP 降级） |
+
+### 28082 端口（Claude Code CLI）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查 |
+| POST | `/v1/messages` | Anthropic Messages API（流式/非流式） |
+| POST | `/v1/messages/count_tokens` | Token 计数估算 |
+
+---
+
+## 环境变量
+
+| 变量 | 说明 |
 |------|------|
-| `CODEX_BRIDGE_LOG_DIR` | 日志目录（默认 `logs/`） |
-| `CODEX_BRIDGE_RESPONSES_COMPAT_CHAT` | Chat 兼容逻辑（默认 `true`） |
+| `CODEX_BRIDGE_RESPONSES_COMPAT_CHAT` | Responses → Chat 兼容（默认 `true`） |
+| `CODEX_BRIDGE_COMPAT_CHAT_STREAM` | 流式转码（默认 `true`） |
 | `CODEX_BRIDGE_RESPONSES_INPUT_AS_STRING` | input 以纯字符串发上游 |
-| `CODEX_BRIDGE_RESPONSES_INPUT_STRING_RETRY` | 400 时尝试将列表 input 压成字符串重试 |
-| `CODEX_BRIDGE_COMPAT_CHAT_STREAM` | 工具+流式时走 chat 流并翻译 SSE |
+| `CODEX_BRIDGE_RESPONSES_INPUT_STRING_RETRY` | 400 时重试字符串模式 |
 | `CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS` | 工具最大轮数（默认 `40`） |
-
-完整定义见 `bridge/chat_bridge.py`。
-
----
-
-## 联调与压测
-
-无自动化测试目录；用 `curl /health`、`/v1/models` 或直连 `POST`。压测见 `bridge/stress_test/`、`bridge/stress_test.ps1`。
-
----
-
-## Go 与插件
-
-- **`bridge/chat_bridge.go`**：另一实现，参数见文件内 `flag`。
-- **`plugin_spec.go`、`handler/`**：嵌入其它服务时的运维路由，**非**独立入口；与 Python 桥联用时注意 `bridge/chat_bridge.py` 路径。
-- 仓库级短说明见根目录 **`SKILL.md`**（与本文不重复罗列步骤）。
+| `CODEX_BRIDGE_TUI_SSE_COMPAT` | TUI SSE 兼容模式（默认 `true`） |
+| `CODEX_BRIDGE_LOG_DIR` | 日志目录（默认 `logs/`） |
+| `CODEX_BRIDGE_TIMEOUT_SEC` | 超时秒数（默认 `999999`） |
 
 ---
 
 ## 常见问题
 
-1. **`config profile 'bridge' not found`** → 信任项目或用户级合并 profile（上文「信任」「不配信任」）；在仓库根运行；根目录识别见「项目根」。
-2. **WebSocket / 404** → 自定义 provider，`supports_websockets = false`，HTTP `/v1/responses`，勿让 Codex 直接 WS 上游。
-3. **上游 400（input）** → `CODEX_BRIDGE_RESPONSES_INPUT_STRING_RETRY` 或 `CODEX_BRIDGE_RESPONSES_INPUT_AS_STRING`。
-4. **日志过大** → `CODEX_BRIDGE_LOG_MAX_STR` 等（`_LOG_MAX_PAYLOAD_STR`）。
+### 1. `Invalid HTTP request received` 大量刷屏
+
+Codex CLI 尝试 WebSocket 连接。桥已内置 WebSocket 优雅关闭处理。若仍出现，检查是否正在运行旧版桥。
+
+### 2. `Self-signed certificate detected`（Claude Code）
+
+Claude Code 28082 端口使用 **plain HTTP**，不要在 `ANTHROPIC_BASE_URL` 中写 `https://`。正确值：`http://127.0.0.1:28082`。
+
+### 3. `stream disconnected before completion`（Codex）
+
+确认 Codex 配置的 `base_url` 使用 `https://`（18081 端口是 HTTPS）。
+
+### 4. `config profile 'bridge' not found`
+
+在 Codex 中信任项目，或将 profile 复制到 `~/.codex/config.toml`。
+
+### 5. 上游 400 错误
+
+尝试设置 `CODEX_BRIDGE_RESPONSES_INPUT_STRING_RETRY=true` 或 `CODEX_BRIDGE_RESPONSES_INPUT_AS_STRING=true`。
+
+---
+
+## 环境要求
+
+- Python **3.10+**
+- 可访问的上游 OpenAI 兼容 API
+- Codex CLI 0.118.0+（其它版本自行验证）
+- Claude Code CLI（可选）
 
 ---
 
 ## 许可证
 
-若无 `LICENSE`，使用前请按组织策略自行补充。
+MIT

@@ -128,7 +128,9 @@ def _log(message: str) -> None:
     try:
         print(console, flush=True)
     except UnicodeEncodeError:
-        print(console.encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
+        import sys
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(console.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
     if _BRIDGE_LOG_PATH:
         try:
             line = f"{ts}\t[run:{rid}]\t{message}\n"
@@ -459,7 +461,7 @@ CODEX_BRIDGE_TUI_SSE_COMPAT = (
     in ("1", "true", "yes", "on")
 )
 
-MAX_TOOL_CALL_ROUNDS = int(os.getenv("CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS", "40"))
+MAX_TOOL_CALL_ROUNDS = int(os.getenv("CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS", "10000"))
 
 # Model aliasing: map Codex internal model names to your actual model
 # Format: comma-separated pairs like "gpt-5.4-mini=Qwen/Qwen3.5-27B,gpt-4o=Qwen/Qwen3.5-27B"
@@ -471,7 +473,7 @@ if _alias_config:
             src, dst = pair.split("=", 1)
             _MODEL_ALIAS_MAP[src.strip()] = dst.strip()
 else:
-    # Default: map common GPT models to Qwen
+    # Default: map common GPT and Claude models to Qwen
     _MODEL_ALIAS_MAP = {
         "gpt-5.4-mini": "Qwen/Qwen3.5-27B",
         "gpt-5-mini": "Qwen/Qwen3.5-27B",
@@ -479,6 +481,12 @@ else:
         "gpt-4o-mini": "Qwen/Qwen3.5-27B",
         "gpt-4": "Qwen/Qwen3.5-27B",
         "gpt-3.5-turbo": "Qwen/Qwen3.5-27B",
+        "claude-sonnet-4-20250514": "Qwen/Qwen3.5-27B",
+        "claude-opus-4-20250514": "Qwen/Qwen3.5-27B",
+        "claude-3-5-sonnet-20241022": "Qwen/Qwen3.5-27B",
+        "claude-3-5-haiku-20241022": "Qwen/Qwen3.5-27B",
+        "claude-3-opus-20240229": "Qwen/Qwen3.5-27B",
+        "claude-3-haiku-20240307": "Qwen/Qwen3.5-27B",
     }
 
 
@@ -493,12 +501,16 @@ def _resolve_model_name(raw_model: str, default_model: str) -> tuple[str, str, b
     model = raw_model.strip()
     was_aliased = False
     
-    # Check if model should be aliased
     if model in _MODEL_ALIAS_MAP:
         original = model
         model = _MODEL_ALIAS_MAP[model]
         was_aliased = True
         _log(f"model_alias: {original} -> {model}")
+    elif model.startswith("claude-"):
+        original = model
+        model = default_model
+        was_aliased = True
+        _log(f"model_alias (claude-* fallback): {original} -> {model}")
     
     return model, "payload", was_aliased
 
@@ -2452,6 +2464,368 @@ def _build_chat_completion(
     }
 
 
+# ---------------------------------------------------------------------------
+# Anthropic Messages API translation (Claude Code CLI support)
+# ---------------------------------------------------------------------------
+
+def _anthropic_messages_to_chat_messages(
+    system: Any, messages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Translate Anthropic Messages format to OpenAI chat messages."""
+    chat_msgs: list[dict[str, Any]] = []
+
+    if system:
+        if isinstance(system, str):
+            chat_msgs.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            parts = []
+            for blk in system:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    parts.append(blk.get("text", ""))
+                elif isinstance(blk, str):
+                    parts.append(blk)
+            if parts:
+                chat_msgs.append({"role": "system", "content": "\n".join(parts)})
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            chat_msgs.append({"role": role, "content": content})
+            continue
+
+        if not isinstance(content, list):
+            chat_msgs.append({"role": role, "content": str(content) if content else ""})
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            btype = blk.get("type", "")
+
+            if btype == "text":
+                text_parts.append(blk.get("text", ""))
+            elif btype == "thinking":
+                pass
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": blk.get("id", f"call_{uuid.uuid4().hex[:20]}"),
+                    "type": "function",
+                    "function": {
+                        "name": blk.get("name", ""),
+                        "arguments": json.dumps(blk.get("input", {}), ensure_ascii=False),
+                    },
+                })
+            elif btype == "tool_result":
+                tr_content = blk.get("content", "")
+                if isinstance(tr_content, list):
+                    tr_parts = []
+                    for c in tr_content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            tr_parts.append(c.get("text", ""))
+                        elif isinstance(c, str):
+                            tr_parts.append(c)
+                    tr_content = "\n".join(tr_parts)
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": blk.get("tool_use_id", ""),
+                    "content": str(tr_content),
+                })
+
+        if role == "assistant":
+            m: dict[str, Any] = {"role": "assistant"}
+            m["content"] = "\n".join(text_parts) if text_parts else None
+            if tool_calls:
+                m["tool_calls"] = tool_calls
+            chat_msgs.append(m)
+        elif role == "user":
+            if tool_results:
+                chat_msgs.extend(tool_results)
+            if text_parts:
+                chat_msgs.append({"role": "user", "content": "\n".join(text_parts)})
+            elif not tool_results:
+                chat_msgs.append({"role": "user", "content": ""})
+        else:
+            chat_msgs.append({"role": role, "content": "\n".join(text_parts) if text_parts else ""})
+
+    return chat_msgs
+
+
+def _anthropic_tools_to_chat_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Translate Anthropic tool definitions to OpenAI function-calling format."""
+    if not tools:
+        return None
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {}),
+            },
+        })
+    return out or None
+
+
+def _anthropic_tool_choice_to_openai(tc: Any) -> Any:
+    if tc is None:
+        return None
+    if isinstance(tc, dict):
+        atype = tc.get("type", "")
+        if atype == "auto":
+            return "auto"
+        if atype == "any":
+            return "required"
+        if atype == "tool":
+            return {"type": "function", "function": {"name": tc.get("name", "")}}
+    return None
+
+
+_ANTHROPIC_STOP_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "content_filter": "end_turn",
+}
+
+
+def _chat_completion_to_anthropic_message(
+    chat_data: dict[str, Any], model: str, request_model: str = "",
+) -> dict[str, Any]:
+    """Translate OpenAI chat completion to Anthropic Message response."""
+    choices = chat_data.get("choices") or []
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+    finish_reason = str(choice.get("finish_reason") or "stop") if isinstance(choice, dict) else "stop"
+
+    content: list[dict[str, Any]] = []
+
+    reasoning = _extract_text_from_content(
+        message.get("reasoning_content") or message.get("reasoning")
+    )
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+
+    text = _extract_text_from_content(message.get("content"))
+    if text:
+        content.append({"type": "text", "text": text})
+
+    tcs = message.get("tool_calls")
+    if isinstance(tcs, list):
+        for tc in tcs:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            try:
+                inp = json.loads(fn.get("arguments", "{}"))
+            except Exception:
+                inp = {"_raw": fn.get("arguments", "")}
+            content.append({
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+                "name": fn.get("name", ""),
+                "input": inp,
+            })
+
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(finish_reason, "end_turn")
+    usage = chat_data.get("usage") or {}
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:20]}",
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": request_model or model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+
+
+def _anthropic_sse_line(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _translate_openai_stream_to_anthropic_sse(
+    httpx_resp: Any,
+    model: str,
+    request_model: str,
+    msg_id: str,
+):
+    """Async generator: consume OpenAI SSE chunks, yield Anthropic Messages SSE bytes."""
+    block_idx = 0
+    in_thinking = False
+    in_text = False
+    tool_blocks: dict[int, dict[str, Any]] = {}
+    output_tokens = 0
+    stop_reason: str | None = None
+
+    yield _anthropic_sse_line("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": request_model or model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+    yield _anthropic_sse_line("ping", {"type": "ping"})
+
+    buffer = ""
+    async for raw_bytes in httpx_resp.aiter_bytes():
+        buffer += raw_bytes.decode("utf-8", errors="replace")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data_str)
+            except Exception:
+                continue
+            choices = chunk.get("choices")
+            if not isinstance(choices, list) or not choices:
+                u = chunk.get("usage")
+                if isinstance(u, dict):
+                    output_tokens = u.get("completion_tokens", output_tokens)
+                continue
+            ch = choices[0] if isinstance(choices[0], dict) else {}
+            delta = ch.get("delta") or {}
+            fr = ch.get("finish_reason")
+
+            # --- reasoning / thinking ---
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                if not in_thinking:
+                    in_thinking = True
+                    yield _anthropic_sse_line("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    })
+                yield _anthropic_sse_line("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": str(reasoning)},
+                })
+
+            # --- text content ---
+            text_piece = delta.get("content")
+            if text_piece is not None and text_piece != "":
+                if in_thinking:
+                    yield _anthropic_sse_line("content_block_stop", {
+                        "type": "content_block_stop", "index": block_idx,
+                    })
+                    block_idx += 1
+                    in_thinking = False
+                if not in_text:
+                    in_text = True
+                    yield _anthropic_sse_line("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                yield _anthropic_sse_line("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": str(text_piece)},
+                })
+
+            # --- tool calls ---
+            tc_list = delta.get("tool_calls")
+            if isinstance(tc_list, list):
+                for tc in tc_list:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_idx = int(tc.get("index", 0))
+                    tc_fn = tc.get("function") or {}
+
+                    if tc_idx not in tool_blocks:
+                        if in_thinking:
+                            yield _anthropic_sse_line("content_block_stop", {
+                                "type": "content_block_stop", "index": block_idx,
+                            })
+                            block_idx += 1
+                            in_thinking = False
+                        if in_text:
+                            yield _anthropic_sse_line("content_block_stop", {
+                                "type": "content_block_stop", "index": block_idx,
+                            })
+                            block_idx += 1
+                            in_text = False
+
+                        tid = tc.get("id") or f"toolu_{uuid.uuid4().hex[:20]}"
+                        tool_blocks[tc_idx] = {"block_idx": block_idx, "id": tid, "name": tc_fn.get("name", "")}
+                        yield _anthropic_sse_line("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tid,
+                                "name": tc_fn.get("name", ""),
+                                "input": {},
+                            },
+                        })
+                        block_idx += 1
+
+                    tb = tool_blocks[tc_idx]
+                    if tc_fn.get("name"):
+                        tb["name"] = tc_fn["name"]
+                    args_delta = tc_fn.get("arguments", "")
+                    if args_delta:
+                        yield _anthropic_sse_line("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": tb["block_idx"],
+                            "delta": {"type": "input_json_delta", "partial_json": args_delta},
+                        })
+
+            if fr:
+                stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(fr, "end_turn")
+            u = chunk.get("usage")
+            if isinstance(u, dict):
+                output_tokens = u.get("completion_tokens", output_tokens)
+
+    # close open blocks
+    if in_thinking:
+        yield _anthropic_sse_line("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        block_idx += 1
+    if in_text:
+        yield _anthropic_sse_line("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        block_idx += 1
+    for _ti, tb in tool_blocks.items():
+        yield _anthropic_sse_line("content_block_stop", {"type": "content_block_stop", "index": tb["block_idx"]})
+
+    yield _anthropic_sse_line("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason or "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+    yield _anthropic_sse_line("message_stop", {"type": "message_stop"})
+
+
 def _resolve_upstream_authorization_header(
     incoming_authorization: str | None, fallback_api_key: str
 ) -> str:
@@ -2480,7 +2854,7 @@ def create_app(
     config_presence_penalty: float = None,
 ) -> Any:
     _ensure_bridge_session_logging()
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import JSONResponse, Response
     import httpx
 
@@ -3338,6 +3712,218 @@ def create_app(
         )
         return JSONResponse(status_code=200, content=result)
 
+    # ------------------------------------------------------------------
+    # Anthropic Messages API  (Claude Code CLI support)
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/messages")
+    @app.post("/messages")
+    async def anthropic_messages(request: Request) -> Any:
+        req_id = uuid.uuid4().hex[:8]
+        started_at = time.time()
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            _log(f"req={req_id} anthropic_messages invalid_json error={_short_text(exc)}")
+            return JSONResponse(status_code=400, content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": f"Invalid JSON body: {exc}"},
+            })
+
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "JSON object body is required"},
+            })
+
+        raw_model = str(payload.get("model") or "").strip()
+        request_model = raw_model
+        model, model_source, _ = _resolve_model_name(raw_model, app.state.default_model)
+        if not model:
+            return JSONResponse(status_code=400, content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "model is required"},
+            })
+
+        system = payload.get("system")
+        messages = payload.get("messages") or []
+        stream_requested = payload.get("stream") is True
+        max_tokens = payload.get("max_tokens", 4096)
+
+        chat_messages = _anthropic_messages_to_chat_messages(system, messages)
+        chat_tools = _anthropic_tools_to_chat_tools(payload.get("tools"))
+
+        up_payload: dict[str, Any] = {
+            "model": model,
+            "messages": chat_messages,
+            "stream": stream_requested,
+        }
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            up_payload["max_tokens"] = max_tokens
+        if chat_tools:
+            up_payload["tools"] = chat_tools
+        tc = _anthropic_tool_choice_to_openai(payload.get("tool_choice"))
+        if tc is not None:
+            up_payload["tool_choice"] = tc
+
+        # temperature / top_p / top_k / presence_penalty from request or config
+        for key in ("temperature", "top_p", "top_k", "presence_penalty"):
+            val = payload.get(key)
+            if isinstance(val, (int, float)):
+                up_payload[key] = val
+            else:
+                cfg_val = getattr(app.state, f"config_{key}", None)
+                if isinstance(cfg_val, (int, float)):
+                    up_payload[key] = cfg_val
+
+        # thinking / extended thinking support
+        thinking_cfg = payload.get("thinking")
+        effective_thinking = False
+        if isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "enabled":
+            effective_thinking = True
+            budget = thinking_cfg.get("budget_tokens")
+            if isinstance(budget, int) and budget > 0:
+                up_payload["max_tokens"] = max(up_payload.get("max_tokens", 4096), budget)
+        elif getattr(app.state, "config_thinking_mode", None):
+            effective_thinking = True
+
+        if effective_thinking:
+            up_payload["enable_thinking"] = True
+            up_payload["reasoning_effort"] = "high"
+
+        auth = _resolve_upstream_authorization_header(
+            request.headers.get("authorization") or request.headers.get("x-api-key"),
+            app.state.upstream_api_key,
+        )
+        headers = {"Authorization": auth, "Content-Type": "application/json"}
+
+        _log(
+            f"req={req_id} inbound path=/v1/messages model={model} request_model={request_model} "
+            f"model_source={model_source} message_count={len(messages)} stream={stream_requested} "
+            f"thinking={effective_thinking}"
+        )
+        _log_interaction_json(req_id, "anthropic_messages.inbound", {
+            "model": model, "request_model": request_model,
+            "stream": stream_requested, "thinking": effective_thinking,
+            "upstream_payload_keys": list(up_payload.keys()),
+        })
+
+        msg_id = f"msg_{uuid.uuid4().hex[:20]}"
+
+        if stream_requested:
+            try:
+                sreq = app.state.client.build_request(
+                    "POST", app.state.upstream_chat_completions_url, json=up_payload, headers=headers,
+                )
+                sresp = await app.state.client.send(sreq, stream=True)
+            except Exception as exc:
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                _log(f"req={req_id} anthropic_stream_error latency_ms={elapsed_ms} error={_short_text(exc)}")
+                return JSONResponse(status_code=502, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": f"Upstream error: {exc}"},
+                })
+
+            if sresp.status_code >= 400:
+                err_raw = await sresp.aread()
+                await _httpx_streaming_body_close(sresp)
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                _log(f"req={req_id} anthropic_stream_status={sresp.status_code} latency_ms={elapsed_ms}")
+                return JSONResponse(status_code=sresp.status_code, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err_raw.decode("utf-8", errors="ignore")[:2000]},
+                })
+
+            from starlette.responses import StreamingResponse
+
+            async def _gen():
+                try:
+                    async for piece in _translate_openai_stream_to_anthropic_sse(
+                        sresp, model, request_model, msg_id,
+                    ):
+                        yield piece.encode("utf-8") if isinstance(piece, str) else piece
+                finally:
+                    await _httpx_streaming_body_close(sresp)
+                    elapsed_ms = int((time.time() - started_at) * 1000)
+                    _log(f"req={req_id} anthropic_stream_done latency_ms={elapsed_ms}")
+
+            return StreamingResponse(
+                _gen(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # non-streaming
+        try:
+            up_payload["stream"] = False
+            resp = await app.state.client.post(
+                app.state.upstream_chat_completions_url, json=up_payload, headers=headers,
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            _log(f"req={req_id} anthropic_upstream_error latency_ms={elapsed_ms} error={_short_text(exc)}")
+            return JSONResponse(status_code=502, content={
+                "type": "error",
+                "error": {"type": "api_error", "message": f"Upstream error: {exc}"},
+            })
+
+        if resp.status_code >= 400:
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            _log(f"req={req_id} anthropic_upstream_status={resp.status_code} latency_ms={elapsed_ms}")
+            return JSONResponse(status_code=resp.status_code, content={
+                "type": "error",
+                "error": {"type": "api_error", "message": resp.text[:2000]},
+            })
+
+        chat_data = resp.json()
+        result = _chat_completion_to_anthropic_message(chat_data, model, request_model)
+        result["id"] = msg_id
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        _log(
+            f"req={req_id} anthropic_done status=200 latency_ms={elapsed_ms} model={model} "
+            f"stop_reason={result.get('stop_reason')}"
+        )
+        _log_interaction_json(req_id, "anthropic_messages.done", {
+            "result_id": msg_id, "stop_reason": result.get("stop_reason"),
+            "content_types": [c.get("type") for c in result.get("content", [])],
+        })
+        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/v1/messages/count_tokens")
+    @app.post("/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        messages = payload.get("messages") or []
+        system = payload.get("system") or ""
+        total_chars = len(json.dumps(messages, ensure_ascii=False)) + len(str(system))
+        estimated = max(1, total_chars // 4)
+        return JSONResponse(status_code=200, content={"input_tokens": estimated})
+
+    # ------------------------------------------------------------------
+    # WebSocket: graceful reject so Codex CLI falls back to HTTP POST
+    # without flooding uvicorn with "Invalid HTTP request received."
+    # ------------------------------------------------------------------
+
+    async def _ws_reject(websocket: WebSocket) -> None:
+        try:
+            await websocket.accept()
+            await websocket.close(code=1000, reason="Use HTTP POST")
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    from starlette.routing import WebSocketRoute
+    for _wspath in ("/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"):
+        app.router.routes.insert(0, WebSocketRoute(_wspath, endpoint=_ws_reject))
+
     return app
 
 
@@ -3386,15 +3972,107 @@ def _load_codex_cli_config() -> tuple[str, str, str]:
     return base_url, api_key, model
 
 
+def _ensure_ssl_cert(cert_dir: Path | None = None) -> tuple[Path, Path]:
+    """Auto-generate a self-signed TLS certificate for localhost if missing.
+
+    Returns (cert_path, key_path).  The cert covers 127.0.0.1 / localhost
+    and is valid for 10 years so restarts don't need regeneration.
+    """
+    if cert_dir is None:
+        cert_dir = Path(os.path.dirname(os.path.abspath(__file__))).parent / ".certs"
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cert_dir / "bridge.crt"
+    key_path = cert_dir / "bridge.key"
+
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path
+
+    _log("generating self-signed TLS certificate for localhost …")
+
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import ipaddress as _ipa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "Codex Bridge localhost CA"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Codex Bridge"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.IPAddress(_ipa.IPv4Address("127.0.0.1")),
+                x509.IPAddress(_ipa.IPv6Address("::1")),
+            ]),
+            critical=False,
+        )
+        .sign(private_key, hashes.SHA256())
+    )
+
+    key_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    _log(f"TLS cert written to {cert_path}")
+    return cert_path, key_path
+
+
+def _install_cert_windows_trust(cert_path: Path) -> bool:
+    """Add the self-signed CA to CurrentUser Trusted Root (no admin needed).
+
+    Returns True on success.  Silently returns False on failure so the
+    bridge can still start without trust installation.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                f'Import-Certificate -FilePath "{cert_path}" '
+                f'-CertStoreLocation Cert:\\CurrentUser\\Root',
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            _log("TLS cert installed into CurrentUser\\Root trust store")
+            return True
+        _log(f"Import-Certificate returned {r.returncode}: {r.stderr.strip()[:200]}")
+    except Exception as exc:
+        _log(f"cert trust install skipped: {_short_text(exc)}")
+    return False
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Codex Chat->Responses bridge")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
+    parser.add_argument("--claude-code-port", type=int, default=28082,
+                        help="Port for Claude Code CLI (Anthropic Messages API). 0 to disable.")
     parser.add_argument("--upstream-base-url", default=None)
     parser.add_argument("--upstream-api-key", default=None)
     parser.add_argument("--default-model", default=None)
     parser.add_argument("--timeout-sec", type=float, default=120.0)
     parser.add_argument("--use-codex-config", action="store_true", help="Load upstream settings from ~/.codex")
+    parser.add_argument("--ssl", action="store_true", default=True,
+                        help="Enable HTTPS with self-signed cert (default: on)")
+    parser.add_argument("--no-ssl", dest="ssl", action="store_false",
+                        help="Disable HTTPS, use plain HTTP")
     return parser.parse_args()
 
 
@@ -4248,12 +4926,30 @@ def main() -> None:
     if not args.upstream_base_url or not args.upstream_api_key or not args.default_model:
         raise RuntimeError("Missing upstream settings (base_url/api_key/model). Provide args or use --use-codex-config or ensure llm_config.json exists.")
 
-    # Kill any process using the target port before starting
     _kill_process_on_port(args.port)
+    claude_code_port = getattr(args, "claude_code_port", 0) or 0
+    if claude_code_port:
+        _kill_process_on_port(claude_code_port)
+
+    ssl_cert: Path | None = None
+    ssl_key: Path | None = None
+    use_ssl = getattr(args, "ssl", True)
+    if use_ssl:
+        try:
+            ssl_cert, ssl_key = _ensure_ssl_cert()
+            if os.name == "nt":
+                _install_cert_windows_trust(ssl_cert)
+        except Exception as exc:
+            _log(f"SSL cert generation failed, falling back to plain HTTP: {_short_text(exc)}")
+            ssl_cert = ssl_key = None
+
+    scheme = "https" if ssl_cert else "http"
 
     base_v1, responses_url, _, chat_completions_url = _normalize_base_urls(args.upstream_base_url)
     _log(
-        f"startup listen={args.host}:{args.port} run_sha256={_BRIDGE_RUN_SHA256} "
+        f"startup listen={scheme}://{args.host}:{args.port} "
+        f"claude_code_port={claude_code_port} "
+        f"run_sha256={_BRIDGE_RUN_SHA256} "
         f"log_file={_BRIDGE_LOG_PATH} interaction_jsonl={_BRIDGE_INTERACTION_JSONL_PATH} "
         f"use_codex_config={str(args.use_codex_config).lower()} "
         f"codex_home={_resolve_codex_home()} upstream_base_v1={base_v1} responses_url={responses_url} "
@@ -4265,23 +4961,41 @@ def main() -> None:
         f"tui_sse_compat={str(CODEX_BRIDGE_TUI_SSE_COMPAT).lower()}"
     )
 
+    _app_kwargs = dict(
+        upstream_base_url=args.upstream_base_url,
+        upstream_api_key=args.upstream_api_key,
+        default_model=args.default_model,
+        timeout_sec=args.timeout_sec,
+        config_temperature=getattr(args, "config_temperature", None),
+        config_thinking_mode=getattr(args, "config_thinking_mode", None),
+        config_context_window=getattr(args, "config_context_window", None),
+        config_top_p=getattr(args, "config_top_p", None),
+        config_top_k=getattr(args, "config_top_k", None),
+        config_presence_penalty=getattr(args, "config_presence_penalty", None),
+    )
+
+    _ssl_kwargs: dict[str, Any] = {}
+    if ssl_cert and ssl_key:
+        _ssl_kwargs = {"ssl_certfile": str(ssl_cert), "ssl_keyfile": str(ssl_key)}
+
     try:
-        import uvicorn  # noqa: F401
-        app = create_app(
-            args.upstream_base_url,
-            args.upstream_api_key,
-            args.default_model,
-            args.timeout_sec,
-            getattr(args, "config_temperature", None),
-            getattr(args, "config_thinking_mode", None),
-            getattr(args, "config_context_window", None),
-            getattr(args, "config_top_p", None),
-            getattr(args, "config_top_k", None),
-            getattr(args, "config_presence_penalty", None),
-        )
         import uvicorn
 
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        app = create_app(**_app_kwargs)
+
+        if claude_code_port:
+            cc_app = create_app(**_app_kwargs)
+            cc_scheme = "http"
+            _log(f"starting Claude Code port on {cc_scheme}://{args.host}:{claude_code_port} (Anthropic Messages API, plain HTTP)")
+            cc_thread = threading.Thread(
+                target=uvicorn.run,
+                kwargs=dict(app=cc_app, host=args.host, port=claude_code_port, log_level="info"),
+                daemon=True,
+                name="claude-code-uvicorn",
+            )
+            cc_thread.start()
+
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info", **_ssl_kwargs)
     except Exception as exc:
         _log(f"fastapi/uvicorn unavailable, falling back to simple-http: {_short_text(exc)}")
         _run_simple_server(
