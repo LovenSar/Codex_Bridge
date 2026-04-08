@@ -23,7 +23,7 @@ flowchart LR
 | 自签名 TLS | 启动时自动生成证书并安装到 Windows 信任库，Codex CLI 开箱即用 |
 | WebSocket 降级 | 优雅接受并关闭 WebSocket 连接，Codex CLI 自动 fallback 到 HTTP POST |
 | Thinking 模式 | 支持 `enable_thinking` / `reasoning_effort`，reasoning token 正确传递 |
-| 工具调用 | 多轮 function_call 转换，循环检测保护（默认 40 轮） |
+| 工具调用 | 多轮 function_call 转换，循环检测保护（默认 10000 轮），单次对话最长 24 小时 |
 | 流式 SSE | OpenAI SSE → Anthropic SSE 双向翻译 |
 
 ---
@@ -189,7 +189,7 @@ Copy-Item $env:USERPROFILE\.claude\settings.json.bak $env:USERPROFILE\.claude\se
 | `--upstream-base-url` | 从 `llm_config.json` | 上游 API 地址 |
 | `--upstream-api-key` | 从 `llm_config.json` | 上游 API Key |
 | `--default-model` | 从 `llm_config.json` | 默认模型 |
-| `--timeout-sec` | `120` | 上游请求超时 |
+| `--timeout-sec` | `86400` | 上游请求超时（默认 24 小时） |
 | `--ssl` / `--no-ssl` | `--ssl` | 是否启用 HTTPS（自签名证书） |
 
 ---
@@ -224,10 +224,10 @@ Copy-Item $env:USERPROFILE\.claude\settings.json.bak $env:USERPROFILE\.claude\se
 | `CODEX_BRIDGE_COMPAT_CHAT_STREAM` | 流式转码（默认 `true`） |
 | `CODEX_BRIDGE_RESPONSES_INPUT_AS_STRING` | input 以纯字符串发上游 |
 | `CODEX_BRIDGE_RESPONSES_INPUT_STRING_RETRY` | 400 时重试字符串模式 |
-| `CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS` | 工具最大轮数（默认 `40`） |
+| `CODEX_BRIDGE_MAX_TOOL_CALL_ROUNDS` | 工具最大轮数（默认 `10000`） |
 | `CODEX_BRIDGE_TUI_SSE_COMPAT` | TUI SSE 兼容模式（默认 `true`） |
 | `CODEX_BRIDGE_LOG_DIR` | 日志目录（默认 `logs/`） |
-| `CODEX_BRIDGE_TIMEOUT_SEC` | 超时秒数（默认 `999999`） |
+| `CODEX_BRIDGE_TIMEOUT_SEC` | 超时秒数（默认 `86400`，即 24 小时） |
 
 ---
 

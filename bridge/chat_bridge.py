@@ -4067,7 +4067,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--upstream-base-url", default=None)
     parser.add_argument("--upstream-api-key", default=None)
     parser.add_argument("--default-model", default=None)
-    parser.add_argument("--timeout-sec", type=float, default=120.0)
+    parser.add_argument("--timeout-sec", type=float, default=86400.0)
     parser.add_argument("--use-codex-config", action="store_true", help="Load upstream settings from ~/.codex")
     parser.add_argument("--ssl", action="store_true", default=True,
                         help="Enable HTTPS with self-signed cert (default: on)")
@@ -4147,7 +4147,7 @@ def create_asgi_app() -> Any:
         upstream_base_url=None,
         upstream_api_key=None,
         default_model=None,
-        timeout_sec=float(os.getenv("CODEX_BRIDGE_TIMEOUT_SEC", "999999")),
+        timeout_sec=float(os.getenv("CODEX_BRIDGE_TIMEOUT_SEC", "86400")),
         use_codex_config=False,
         config_temperature=None,
         config_thinking_mode=None,
