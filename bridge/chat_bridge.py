@@ -125,7 +125,10 @@ def _log(message: str) -> None:
     ts = datetime.datetime.now().isoformat(timespec="milliseconds")
     rid = _BRIDGE_RUN_SHA256[:16] if _BRIDGE_RUN_SHA256 else "----------------"
     console = f"[bridge][run:{rid}] {message}"
-    print(console, flush=True)
+    try:
+        print(console, flush=True)
+    except UnicodeEncodeError:
+        print(console.encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
     if _BRIDGE_LOG_PATH:
         try:
             line = f"{ts}\t[run:{rid}]\t{message}\n"
@@ -283,17 +286,8 @@ def _emit_console_dialogue_summary(
                 if isinstance(msg, dict) and not reply:
                     reply = str(msg.get("content") or "")
 
-    # 助手正文与思考：仅旧式字符串拼接，思考接在助手回复末尾（不再单独开 [思考 / reasoning] 区块）
     reply_st = reply.strip() if isinstance(reply, str) else str(reply or "").strip()
     reason_st = reason.strip() if isinstance(reason, str) else str(reason or "").strip()
-    if reply_st and reason_st:
-        reply_block = reply_st + "\n\n" + reason_st
-    elif reply_st:
-        reply_block = reply_st
-    elif reason_st:
-        reply_block = reason_st
-    else:
-        reply_block = "(无)"
 
     lines = [
         "",
@@ -303,10 +297,14 @@ def _emit_console_dialogue_summary(
         "[用户发送]",
         user_txt if user_txt.strip() else "(无)",
         "",
-        "[助手回复]",
-        reply_block,
-        "",
     ]
+    if reason_st:
+        lines.append("[思考 / reasoning]")
+        lines.append(reason_st)
+        lines.append("")
+    lines.append("[助手回复]")
+    lines.append(reply_st if reply_st else "(无)")
+    lines.append("")
     text = "\n".join(lines)
     if len(text) > _CONSOLE_DIALOGUE_MAX_CHARS:
         text = text[: _CONSOLE_DIALOGUE_MAX_CHARS] + "\n...[truncated，完整内容见 .transcript.log]"
@@ -314,8 +312,8 @@ def _emit_console_dialogue_summary(
     if not _CONSOLE_DIALOGUE_BANNER_SHOWN:
         _CONSOLE_DIALOGUE_BANNER_SHOWN = True
         _log(
-            "提示：以下 [用户发送]/[助手回复] 出现在「运行 python chat_bridge.py 的终端」；"
-            "思考内容已拼在 [助手回复] 末尾。Codex 界面是另一个进程，不会在这里显示。"
+            "提示：以下 [用户发送]/[思考]/[助手回复] 出现在「运行 python chat_bridge.py 的终端」。"
+            "Codex 界面是另一个进程，不会在这里显示。"
         )
     _log(text)
 
@@ -354,14 +352,17 @@ def _log_dialogue_transcript(
     extra: dict[str, Any] | None = None,
 ) -> None:
     """终端摘要 + 将完整内容写入 .transcript.log / JSONL。"""
-    _emit_console_dialogue_summary(
-        req_id,
-        phase,
-        inbound_input,
-        upstream_chat_completion,
-        converted_responses,
-        extra,
-    )
+    try:
+        _emit_console_dialogue_summary(
+            req_id,
+            phase,
+            inbound_input,
+            upstream_chat_completion,
+            converted_responses,
+            extra,
+        )
+    except Exception as exc:
+        _log(f"req={req_id} console_dialogue_summary_error: {_short_text(exc)}")
 
     if not _FULL_TRANSCRIPT_ENABLED:
         return
@@ -1497,21 +1498,21 @@ def _build_codex_tui_compat_stream_sse(response_obj: dict[str, Any]) -> str:
             for piece in _split_sse_text_chunks(rtext, chunk_sz):
                 emit(
                     {
-                        "type": "response.reasoning_text.delta",
+                        "type": "response.reasoning_summary_text.delta",
                         "response_id": response_id,
                         "delta": piece,
                         "item_id": rid,
                         "output_index": output_index,
-                        "content_index": 0,
+                        "summary_index": 0,
                     }
                 )
             emit(
                 {
-                    "type": "response.reasoning_text.done",
+                    "type": "response.reasoning_summary_text.done",
                     "response_id": response_id,
                     "item_id": rid,
                     "output_index": output_index,
-                    "content_index": 0,
+                    "summary_index": 0,
                     "text": rtext,
                 }
             )
@@ -2140,20 +2141,21 @@ def _responses_payload_to_chat_payload(payload: dict[str, Any], model: str, app_
 
 def _build_reasoning_item_for_responses(reasoning_text: str) -> dict[str, Any]:
     """
-    OpenAI Responses 中 Reasoning 条目的规范形状：content 为 reasoning_text 片段列表
-    （见 API Reasoning 对象）。旧版仅用顶层 text 时，部分客户端无法渲染思考过程。
+    OpenAI Responses 中 Reasoning 条目。
+    - summary: 客户端（Codex TUI 等）实际展示的文本，放完整思考内容。
+    - content: 内部推理 token（OpenAI 加密，本地模型直接放原文）。
     """
     return {
         "type": "reasoning",
         "id": f"rs_{uuid.uuid4().hex[:10]}",
-        "summary": [],
+        "summary": [{"type": "summary_text", "text": reasoning_text}],
         "content": [{"type": "reasoning_text", "text": reasoning_text}],
         "status": "completed",
     }
 
 
 def _normalize_reasoning_items_in_response(resp: dict[str, Any]) -> dict[str, Any]:
-    """若上游 reasoning 只写了顶层 text、未写 content.reasoning_text，补全为官方形状。"""
+    """若上游 reasoning 缺少 content/summary，从 text 等字段补全为完整形状。"""
     if not isinstance(resp, dict):
         return resp
     out = resp.get("output")
@@ -2173,16 +2175,33 @@ def _normalize_reasoning_items_in_response(resp: dict[str, Any]) -> dict[str, An
             if isinstance(p, dict) and str(p.get("type") or "").strip().lower() == "reasoning_text":
                 has_rt = True
                 break
-        if has_rt:
+        has_summary = False
+        for p in item.get("summary") or []:
+            if isinstance(p, dict) and str(p.get("type") or "").strip().lower() == "summary_text":
+                has_summary = True
+                break
+        if has_rt and has_summary:
             new_out.append(item)
             continue
         txt = item.get("text")
         if isinstance(txt, str) and txt.strip():
             it2 = dict(item)
-            it2["content"] = [{"type": "reasoning_text", "text": txt}]
+            if not has_rt:
+                it2["content"] = [{"type": "reasoning_text", "text": txt}]
+            if not has_summary:
+                it2["summary"] = [{"type": "summary_text", "text": txt}]
             it2.setdefault("status", "completed")
             new_out.append(it2)
             changed = True
+        elif has_rt and not has_summary:
+            rt_text = _reasoning_plain_text_from_item(item)
+            if rt_text:
+                it2 = dict(item)
+                it2["summary"] = [{"type": "summary_text", "text": rt_text}]
+                new_out.append(it2)
+                changed = True
+            else:
+                new_out.append(item)
         else:
             new_out.append(item)
     if not changed:
@@ -2211,8 +2230,8 @@ def _chat_completion_to_responses_payload(
     tool_calls = message.get("tool_calls")
     has_structured_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
 
-    # 仅有工具调用时仍单独挂 reasoning 条目（此路径不生成普通 message 正文）。
-    # 普通对话：思考与正文合并进 message 的 output_text，避免 Codex clean 里出现「正文+思考」两套。
+    # 有工具调用时 reasoning 作为独立 item（没有 message 正文可嵌入）；
+    # 无工具调用时 reasoning 嵌入 message content（规避 Codex TUI 不渲染 reasoning item 的 bug）。
     if reasoning_content and has_structured_tool_calls:
         output.append(_build_reasoning_item_for_responses(reasoning_content))
     if has_structured_tool_calls:
@@ -2244,7 +2263,6 @@ def _chat_completion_to_responses_payload(
                 }
             )
 
-    # 有 reasoning 时原先 `if not output` 为假，会漏掉助手正文；Codex 需要 `type: message` 才有正式回复。
     if not has_structured_tool_calls:
         content = _extract_text_from_content(message.get("content"))
         parsed_text_tc = _parse_loose_tool_call_text(content)
@@ -2262,18 +2280,17 @@ def _chat_completion_to_responses_payload(
             )
         else:
             text_body = content if isinstance(content, str) else str(content or "")
-            body_st = text_body.strip() if text_body.strip() else ""
+            body_st = text_body.strip()
             reason_st = (reasoning_content or "").strip()
-            # 与终端摘要一致：正文与思考旧式拼接，一并推给 Codex 的 output_text（clean 里只见一段）
             if body_st and reason_st:
-                display_text = body_st + "\n\n" + reason_st
+                display_text = f"<think>\n{reason_st}\n</think>\n\n{body_st}"
             elif body_st:
                 display_text = body_st
             elif reason_st:
-                display_text = reason_st
+                display_text = f"<think>\n{reason_st}\n</think>"
             else:
                 display_text = ""
-            if display_text or not reason_st:
+            if display_text:
                 output.append(
                     {
                         "type": "message",
@@ -2306,9 +2323,9 @@ def _chat_completion_to_responses_payload(
 
 
 def _extract_output_text(resp: dict[str, Any]) -> str:
+    """Extract only the assistant reply text (excluding reasoning) from a Responses payload."""
     if not isinstance(resp, dict):
         return ""
-    reasoning_text = _extract_reasoning_text(resp)
     output = resp.get("output")
     assistant_text = ""
     if isinstance(output, list):
@@ -2331,13 +2348,8 @@ def _extract_output_text(resp: dict[str, Any]) -> str:
                 parts.append(content)
         if parts:
             assistant_text = "".join(parts)
-    # Fallback to top-level text fields
     if not assistant_text and "output_text" in resp:
         assistant_text = _extract_text_from_content(resp.get("output_text"))
-    if reasoning_text:
-        if assistant_text:
-            return f"{reasoning_text}\n\n{assistant_text}"
-        return reasoning_text
     return assistant_text
 
 
@@ -2417,8 +2429,13 @@ def _usage_from_chat_completion(resp: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def _build_chat_completion(model: str, text: str, usage: dict[str, Any]) -> dict[str, Any]:
+def _build_chat_completion(
+    model: str, text: str, usage: dict[str, Any], reasoning_content: str = ""
+) -> dict[str, Any]:
     created_at = int(time.time())
+    message: dict[str, Any] = {"role": "assistant", "content": text}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     return {
         "id": f"chatcmpl_{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
@@ -2427,7 +2444,7 @@ def _build_chat_completion(model: str, text: str, usage: dict[str, Any]) -> dict
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
@@ -3288,13 +3305,15 @@ def create_app(
 
         resp_data = upstream_resp.json()
         assistant_text = _extract_output_text(resp_data)
+        reasoning_text = _extract_reasoning_text(resp_data)
         usage = _usage_from_responses(resp_data)
-        result = _build_chat_completion(model, assistant_text, usage)
+        result = _build_chat_completion(model, assistant_text, usage, reasoning_content=reasoning_text)
         elapsed_ms = int((time.time() - started_at) * 1000)
         _log(
             f"req={req_id} done status=200 latency_ms={elapsed_ms} model={model} "
             f"prompt_tokens={usage.get('prompt_tokens', 0)} completion_tokens={usage.get('completion_tokens', 0)} "
-            f"total_tokens={usage.get('total_tokens', 0)} output_chars={len(assistant_text)}"
+            f"total_tokens={usage.get('total_tokens', 0)} output_chars={len(assistant_text)} "
+            f"reasoning_chars={len(reasoning_text)}"
         )
         _log_interaction_json(
             req_id,
@@ -4133,13 +4152,15 @@ def _run_simple_server(
 
             resp_data = _json.loads(body.decode("utf-8"))
             assistant_text = _extract_output_text(resp_data)
+            reasoning_text = _extract_reasoning_text(resp_data)
             usage = _usage_from_responses(resp_data)
-            result = _build_chat_completion(model, assistant_text, usage)
+            result = _build_chat_completion(model, assistant_text, usage, reasoning_content=reasoning_text)
             elapsed_ms = int((time.time() - started_at) * 1000)
             _log(
                 f"req={req_id} done status=200 latency_ms={elapsed_ms} model={model} "
                 f"prompt_tokens={usage.get('prompt_tokens', 0)} completion_tokens={usage.get('completion_tokens', 0)} "
-                f"total_tokens={usage.get('total_tokens', 0)} output_chars={len(assistant_text)}"
+                f"total_tokens={usage.get('total_tokens', 0)} output_chars={len(assistant_text)} "
+                f"reasoning_chars={len(reasoning_text)}"
             )
             self._send_json(200, result)
 
