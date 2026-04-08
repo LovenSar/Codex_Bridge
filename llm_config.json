@@ -9,6 +9,7 @@
   "presence_penalty": 1.5,
   "max_tokens": 4096,
   "thinking_mode": true,
+  "reasoning_effort": "medium",
   "batch_size": 0,
   "max_workers": 0,
   "use_async": false,

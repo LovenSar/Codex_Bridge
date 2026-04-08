@@ -2139,11 +2139,8 @@ def _responses_payload_to_chat_payload(payload: dict[str, Any], model: str, app_
 
     if effective_thinking:
         chat_payload["enable_thinking"] = True
-        reff = payload.get("reasoning_effort")
-        if isinstance(reff, str) and reff.strip():
-            chat_payload["reasoning_effort"] = reff.strip()
-        else:
-            chat_payload["reasoning_effort"] = "high"
+        cfg_def = _cfg("config_reasoning_effort_default")
+        chat_payload["reasoning_effort"] = _coerce_reasoning_effort(payload.get("reasoning_effort"), cfg_def)
         _log(
             f"thinking_mode enabled: enable_thinking=True, reasoning_effort={chat_payload.get('reasoning_effort')}"
         )
@@ -2852,6 +2849,7 @@ def create_app(
     config_top_p: float = None,
     config_top_k: int = None,
     config_presence_penalty: float = None,
+    config_reasoning_effort_default: str = None,
 ) -> Any:
     _ensure_bridge_session_logging()
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -2880,10 +2878,12 @@ def create_app(
         application.state.config_top_p = config_top_p
         application.state.config_top_k = config_top_k
         application.state.config_presence_penalty = config_presence_penalty
+        application.state.config_reasoning_effort_default = config_reasoning_effort_default
         _log(
             f"app.state.config_thinking_mode={config_thinking_mode} "
             f"config_top_p={config_top_p} config_top_k={config_top_k} "
-            f"config_presence_penalty={config_presence_penalty}"
+            f"config_presence_penalty={config_presence_penalty} "
+            f"config_reasoning_effort_default={config_reasoning_effort_default!r}"
         )
         application.state.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_sec, connect=10.0),
@@ -3566,7 +3566,8 @@ def create_app(
             responses_payload["enable_thinking"] = enable_thinking
             # 也保留 reasoning_effort 以兼容其他实现
             if enable_thinking:
-                reasoning_effort = payload.get("reasoning_effort", "high")
+                cfg_re = getattr(app.state, "config_reasoning_effort_default", None)
+                reasoning_effort = _coerce_reasoning_effort(payload.get("reasoning_effort"), cfg_re)
                 responses_payload["reasoning_effort"] = reasoning_effort
                 _log(f"req={req_id} thinking_mode enabled: enable_thinking=True, reasoning_effort={reasoning_effort}")
         
@@ -3790,7 +3791,8 @@ def create_app(
 
         if effective_thinking:
             up_payload["enable_thinking"] = True
-            up_payload["reasoning_effort"] = "high"
+            cfg_re = getattr(app.state, "config_reasoning_effort_default", None)
+            up_payload["reasoning_effort"] = _coerce_reasoning_effort(payload.get("reasoning_effort"), cfg_re)
 
         auth = _resolve_upstream_authorization_header(
             request.headers.get("authorization") or request.headers.get("x-api-key"),
@@ -4092,6 +4094,25 @@ def _coerce_bool(value: Any) -> bool | None:
     return None
 
 
+def _coerce_reasoning_effort(requested: Any, config_default: Any) -> str:
+    """
+    上游 reasoning_effort：llm_config 默认 + 请求覆盖；不低于 medium。
+    合法输出：medium | high（minimal/low 会抬到 medium）。
+    """
+    d = "medium"
+    if isinstance(config_default, str) and config_default.strip():
+        d = config_default.strip().lower()
+    if isinstance(requested, str) and requested.strip():
+        v = requested.strip().lower()
+    else:
+        v = d
+    if v in ("minimal", "low"):
+        v = "medium"
+    if v not in ("medium", "high"):
+        v = "medium"
+    return v
+
+
 def _ensure_bridge_config(args: argparse.Namespace) -> None:
     """Fill upstream_base_url / api_key / default_model from llm_config.json or ~/.codex."""
     plugin_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "llm_config.json")
@@ -4124,6 +4145,8 @@ def _ensure_bridge_config(args: argparse.Namespace) -> None:
             args.config_top_k = plugin_cfg.get("top_k")
         if getattr(args, "config_presence_penalty", None) is None:
             args.config_presence_penalty = plugin_cfg.get("presence_penalty")
+        if getattr(args, "config_reasoning_effort_default", None) is None:
+            args.config_reasoning_effort_default = plugin_cfg.get("reasoning_effort")
         _log(f"merged config from llm_config.json: {plugin_config_path}")
 
     if args.use_codex_config:
@@ -4155,6 +4178,7 @@ def create_asgi_app() -> Any:
         config_top_p=None,
         config_top_k=None,
         config_presence_penalty=None,
+        config_reasoning_effort_default=None,
     )
     _ensure_bridge_config(args)
     if not args.upstream_base_url or not args.upstream_api_key or not args.default_model:
@@ -4172,6 +4196,7 @@ def create_asgi_app() -> Any:
         getattr(args, "config_top_p", None),
         getattr(args, "config_top_k", None),
         getattr(args, "config_presence_penalty", None),
+        getattr(args, "config_reasoning_effort_default", None),
     )
 
 
@@ -4188,6 +4213,7 @@ def _run_simple_server(
     config_top_p: float = None,
     config_top_k: int = None,
     config_presence_penalty: float = None,
+    config_reasoning_effort_default: str = None,
 ) -> None:
     import json as _json
     import urllib.request as _urlreq
@@ -4214,6 +4240,7 @@ def _run_simple_server(
         config_top_p=config_top_p,
         config_top_k=config_top_k,
         config_presence_penalty=config_presence_penalty,
+        config_reasoning_effort_default=config_reasoning_effort_default,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -4743,7 +4770,8 @@ def _run_simple_server(
                 responses_payload["enable_thinking"] = enable_thinking
                 # 也保留 reasoning_effort 以兼容其他实现
                 if enable_thinking:
-                    reasoning_effort = payload.get("reasoning_effort", "high")
+                    cfg_re = getattr(app.state, "config_reasoning_effort_default", None)
+                    reasoning_effort = _coerce_reasoning_effort(payload.get("reasoning_effort"), cfg_re)
                     responses_payload["reasoning_effort"] = reasoning_effort
                     _log(f"req={req_id} thinking_mode enabled: enable_thinking=True, reasoning_effort={reasoning_effort}")
             
@@ -4972,6 +5000,7 @@ def main() -> None:
         config_top_p=getattr(args, "config_top_p", None),
         config_top_k=getattr(args, "config_top_k", None),
         config_presence_penalty=getattr(args, "config_presence_penalty", None),
+        config_reasoning_effort_default=getattr(args, "config_reasoning_effort_default", None),
     )
 
     _ssl_kwargs: dict[str, Any] = {}
@@ -5011,6 +5040,7 @@ def main() -> None:
             getattr(args, "config_top_p", None),
             getattr(args, "config_top_k", None),
             getattr(args, "config_presence_penalty", None),
+            getattr(args, "config_reasoning_effort_default", None),
         )
 
 
