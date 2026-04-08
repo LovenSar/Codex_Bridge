@@ -4040,21 +4040,39 @@ def _install_cert_windows_trust(cert_path: Path) -> bool:
 
     Returns True on success.  Silently returns False on failure so the
     bridge can still start without trust installation.
+
+    Uses .NET X509Store via PowerShell instead of Import-Certificate so we
+    do not rely on the Cert: PSDrive (some environments report that drive
+    missing and fail with "找不到驱动器" / drive not found).
     """
+    import base64
     import subprocess as _sp
     try:
+        path = str(cert_path.resolve()).replace("'", "''")
+        script = (
+            f"$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{path}'); "
+            "$store = New-Object System.Security.Cryptography.X509Certificates.X509Store("
+            "[System.Security.Cryptography.X509Certificates.StoreName]::Root, "
+            "[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser); "
+            "$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite); "
+            "$store.Add($cert); "
+            "$store.Close()"
+        )
+        enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         r = _sp.run(
             [
-                "powershell", "-NoProfile", "-Command",
-                f'Import-Certificate -FilePath "{cert_path}" '
-                f'-CertStoreLocation Cert:\\CurrentUser\\Root',
+                "powershell", "-NoProfile", "-NonInteractive",
+                "-EncodedCommand", enc,
             ],
             capture_output=True, text=True, timeout=15,
         )
         if r.returncode == 0:
             _log("TLS cert installed into CurrentUser\\Root trust store")
             return True
-        _log(f"Import-Certificate returned {r.returncode}: {r.stderr.strip()[:200]}")
+        err = (r.stderr or "").strip()
+        out = (r.stdout or "").strip()
+        tail = (err + out)[:400]
+        _log(f"cert trust install returned {r.returncode}: {tail}")
     except Exception as exc:
         _log(f"cert trust install skipped: {_short_text(exc)}")
     return False
